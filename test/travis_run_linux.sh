@@ -39,6 +39,9 @@ if test ! -v SKIP_TESTING; then
         CONFIG="--with-test-suite=test/perl-framework $CONFIG"
         WITH_TEST_SUITE=1
     fi
+
+    # Use the CPAN environment.
+    eval $(perl -I ~/perl5/lib/perl5/ -Mlocal::lib)
 fi
 if test -v APR_VERSION; then
     CONFIG="$CONFIG --with-apr=$HOME/root/apr-${APR_VERSION}"
@@ -55,13 +58,9 @@ fi
 # build the version we want from source
 if test -v TEST_MOD_TLS; then
   RUSTLS_HOME="$HOME/build/rustls-ffi"
-  RUSTLS_VERSION="v0.8.2"
-  git clone https://github.com/rustls/rustls-ffi.git "$RUSTLS_HOME"
+  RUSTLS_VERSION="v0.10.0"
+  git clone -b "$RUSTLS_VERSION" https://github.com/rustls/rustls-ffi.git "$RUSTLS_HOME"
   pushd "$RUSTLS_HOME"
-    git fetch origin
-    git checkout tags/$RUSTLS_VERSION
-    # force an update to cbindgen as focal seems to deliver v0.12.1
-    cargo install --force cbindgen
     make install DESTDIR="$PREFIX"
   popd
   CONFIG="$CONFIG --with-tls --with-rustls=$PREFIX"
@@ -117,14 +116,44 @@ if ! test -v SKIP_TESTING; then
 
     if ! test -v NO_TEST_FRAMEWORK; then
         if test -v WITH_TEST_SUITE; then
-            make check TESTS="${TESTS}" TEST_CONFIG="${TEST_ARGS}"
-            RV=$?
+            make check TESTS="${TESTS}" TEST_CONFIG="${TEST_ARGS}" | tee test.log
+            RV=${PIPESTATUS[0]}
+            # re-run failing tests with -v, avoiding set -e
+            if [ $RV -ne 0 ]; then
+                # mv test/perl-framework/t/logs/error_log test/perl-framework/t/logs/error_log_save
+                FAILERS=""
+                while read FAILER; do
+                    FAILERS="$FAILERS $FAILER"
+                done < <(awk '/Failed:/{print $1}' test.log)
+                if [ -n "$FAILERS" ]; then
+                    t/TEST -v $FAILERS || true
+                fi
+                # set -e would have killed us after the original t/TEST
+                rm -f test.log
+                # mv test/perl-framework/t/logs/error_log_save test/perl-framework/t/logs/error_log
+                false
+            fi
         else
             test -v TEST_INSTALL || make install
             pushd test/perl-framework
                 perl Makefile.PL -apxs $PREFIX/bin/apxs
-                make test APACHE_TEST_EXTRA_ARGS="${TEST_ARGS} ${TESTS}"
-                RV=$?
+                make test APACHE_TEST_EXTRA_ARGS="${TEST_ARGS} ${TESTS}" | tee test.log
+                RV=${PIPESTATUS[0]}
+                # re-run failing tests with -v, avoiding set -e
+                if [ $RV -ne 0 ]; then
+                    # mv t/logs/error_log t/logs/error_log_save
+                    FAILERS=""
+                    while read FAILER; do
+                        FAILERS="$FAILERS $FAILER"
+                    done < <(awk '/Failed:/{print $1}' test.log)
+                    if [ -n "$FAILERS" ]; then
+                        t/TEST -v $FAILERS || true
+                    fi
+                    # set -e would have killed us after the original t/TEST
+                    rm -f test.log
+                    # mv t/logs/error_log_save t/logs/error_log
+                    false
+                fi
             popd
         fi
 
@@ -179,10 +208,6 @@ if ! test -v SKIP_TESTING; then
         popd
     fi
 
-    if test $RV -ne 0 && test -f test/perl-framework/t/logs/error_log; then
-        grep -v ':\(debug\|trace[12345678]\)\]' test/perl-framework/t/logs/error_log
-    fi
-
     if test -v TEST_CORE -a $RV -eq 0; then
         # Run HTTP/2 tests.
         MPM=event py.test-3 test/modules/core
@@ -214,7 +239,6 @@ if ! test -v SKIP_TESTING; then
         #         imports crypto/ed25519: unrecognized import path "crypto/ed25519" (import path does not begin with hostname)
         #
         # but works on a docker ubuntu-focal image. ???
-        export GOROOT=/usr/lib/go-1.14
         export GOPATH=${PREFIX}/gocode
         mkdir -p "${GOPATH}"
         export PATH="${GOROOT}/bin:${GOPATH}/bin:${PATH}"

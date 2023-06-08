@@ -1,9 +1,10 @@
 import pytest
 
-from .env import H2Conf
+from .env import H2Conf, H2TestEnv
 
 
 # The push tests depend on "nghttp"
+@pytest.mark.skipif(condition=H2TestEnv.is_unsupported, reason="mod_http2 not supported here")
 class TestEarlyHints:
 
     @pytest.fixture(autouse=True, scope='class')
@@ -20,12 +21,19 @@ class TestEarlyHints:
         <Location /006-nohints.html>
             Header add Link "</006/006.css>;rel=preload"
         </Location>
+        <Location /006-early.html>
+            H2EarlyHint Link "</006/006.css>;rel=preload;as=style"
+        </Location>
+        <Location /006-early-no-push.html>
+            H2Push off
+            H2EarlyHint Link "</006/006.css>;rel=preload;as=style"
+        </Location>
         """).end_vhost(
         ).install()
         assert env.apache_restart() == 0
 
     # H2EarlyHints enabled in general, check that it works for H2PushResource
-    def test_h2_401_31(self, env):
+    def test_h2_401_31(self, env, repeat):
         url = env.mkurl("https", "hints", "/006-hints.html")
         r = env.nghttp().get(url)
         assert r.response["status"] == 200
@@ -37,10 +45,35 @@ class TestEarlyHints:
         assert early["header"]["link"]
 
     # H2EarlyHints enabled in general, but does not trigger on added response headers
-    def test_h2_401_32(self, env):
+    def test_h2_401_32(self, env, repeat):
         url = env.mkurl("https", "hints", "/006-nohints.html")
         r = env.nghttp().get(url)
         assert r.response["status"] == 200
         promises = r.results["streams"][r.response["id"]]["promises"]
         assert 1 == len(promises)
         assert "previous" not in r.response
+
+    # H2EarlyHints enabled in general, check that it works for H2EarlyHint
+    def test_h2_401_33(self, env, repeat):
+        url = env.mkurl("https", "hints", "/006-early.html")
+        r = env.nghttp().get(url)
+        assert r.response["status"] == 200
+        promises = r.results["streams"][r.response["id"]]["promises"]
+        assert 1 == len(promises)
+        early = r.response["previous"]
+        assert early
+        assert 103 == int(early["header"][":status"])
+        assert early["header"]["link"] == '</006/006.css>;rel=preload;as=style'
+
+    # H2EarlyHints enabled, no PUSH, check that it works for H2EarlyHint
+    def test_h2_401_34(self, env, repeat):
+        url = env.mkurl("https", "hints", "/006-early-no-push.html")
+        r = env.nghttp().get(url)
+        assert r.response["status"] == 200
+        promises = r.results["streams"][r.response["id"]]["promises"]
+        assert 0 == len(promises)
+        early = r.response["previous"]
+        assert early
+        assert 103 == int(early["header"][":status"])
+        assert early["header"]["link"] == '</006/006.css>;rel=preload;as=style'
+

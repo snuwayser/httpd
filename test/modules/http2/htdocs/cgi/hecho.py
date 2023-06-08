@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-import cgi, os
-import cgitb; cgitb.enable()
+import os, sys
+from requestparser import get_request_params
+
+
+forms, files = get_request_params()
 
 status = '200 Ok'
 
 try:
-    form = cgi.FieldStorage()
-    
+
     # A nested FieldStorage instance holds the file
-    name = form['name'].value
+    name = forms['name']
     value = ''
     
     try:
-        value = form['value'].value
+        value = forms['value']
     except KeyError:
         value = os.environ.get("HTTP_"+name, "unset")
     

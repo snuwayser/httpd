@@ -905,6 +905,7 @@ void child_main(apr_pool_t *pconf, DWORD parent_pid)
     int rv;
     int i;
     int num_events;
+    int graceful_shutdown = 0;
 
     /* Get a sub context for global allocations in this child, so that
      * we can have cleanups occur when the child exits.
@@ -1114,6 +1115,7 @@ void child_main(apr_pool_t *pconf, DWORD parent_pid)
             ap_log_error(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, ap_server_conf, APLOGNO(00357)
                          "Child: Exit event signaled. Child process is "
                          "ending.");
+            graceful_shutdown = 1;
             break;
         }
         else if (cld == 2) {
@@ -1132,6 +1134,7 @@ void child_main(apr_pool_t *pconf, DWORD parent_pid)
                          "MaxConnectionsPerChild. Signaling the parent to "
                          "restart a new child process.");
             ap_signal_parent(SIGNAL_PARENT_RESTART);
+            graceful_shutdown = 1;
             break;
         }
     }
@@ -1157,6 +1160,10 @@ void child_main(apr_pool_t *pconf, DWORD parent_pid)
      * already accepted connections.
      */
     SetEvent(listener_shutdown_event);
+
+    /* Notify anyone interested that this child is stopping.
+     */
+    ap_run_child_stopping(pchild, graceful_shutdown);
 
     Sleep(1000);
 
@@ -1200,7 +1207,7 @@ void child_main(apr_pool_t *pconf, DWORD parent_pid)
 
     while (threads_created)
     {
-        struct worker_info *info = workers[threads_created - 1];
+        struct worker_info *info = &workers[threads_created - 1];
         DWORD dwRet;
 
         if (time_remains < 0)
@@ -1235,7 +1242,7 @@ void child_main(apr_pool_t *pconf, DWORD parent_pid)
                      "Child: Waiting for %d threads timed out, terminating process.",
                      threads_created);
         for (i = 0; i < threads_created; i++) {
-            struct worker_info *info = workers[i];
+            struct worker_info *info = &workers[i];
             ap_update_child_status_from_indexes(0, info->num, SERVER_DEAD, NULL);
         }
         /* We can't wait for any longer, but still have some threads remaining.
@@ -1254,6 +1261,8 @@ void child_main(apr_pool_t *pconf, DWORD parent_pid)
     }
     ap_log_error(APLOG_MARK, APLOG_NOTICE, APR_SUCCESS, ap_server_conf, APLOGNO(00364)
                  "Child: All worker threads have exited.");
+
+    ap_run_child_stopped(pchild, graceful_shutdown);
 
     apr_thread_mutex_destroy(child_lock);
     apr_thread_mutex_destroy(ctxpool_lock);

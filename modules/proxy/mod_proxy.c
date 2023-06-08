@@ -52,6 +52,9 @@ proxy_hcmethods_t PROXY_DECLARE_DATA proxy_hcmethods[] = {
     {GET, "GET", 1},
     {CPING, "CPING", 0},
     {PROVIDER, "PROVIDER", 0},
+    {OPTIONS11, "OPTIONS11", 1},
+    {HEAD11, "HEAD11", 1},
+    {GET11, "GET11", 1},
     {EOT, NULL, 1}
 };
 
@@ -966,6 +969,8 @@ PROXY_DECLARE(int) ap_proxy_trans_match(request_rec *r, struct proxy_alias *ent,
     }
 
     if (found) {
+        unsigned int encoded = ent->flags & PROXYPASS_MAP_ENCODED;
+
         /* A proxy module is assigned this URL, check whether it's interested
          * in the request itself (e.g. proxy_wstunnel cares about Upgrade
          * requests only, and could hand over to proxy_http otherwise).
@@ -985,6 +990,9 @@ PROXY_DECLARE(int) ap_proxy_trans_match(request_rec *r, struct proxy_alias *ent,
         if (ent->flags & PROXYPASS_NOQUERY) {
             apr_table_setn(r->notes, "proxy-noquery", "1");
         }
+        if (encoded) {
+            apr_table_setn(r->notes, "proxy-noencode", "1");
+        }
 
         if (servlet_uri) {
             ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r, APLOGNO(10248)
@@ -998,13 +1006,13 @@ PROXY_DECLARE(int) ap_proxy_trans_match(request_rec *r, struct proxy_alias *ent,
              */
             AP_DEBUG_ASSERT(strlen(r->uri) >= strlen(servlet_uri));
             strcpy(r->uri, servlet_uri);
-            return DONE;
         }
-
-        ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r, APLOGNO(03464)
-                      "URI path '%s' matches proxy handler '%s'", r->uri,
-                      found);
-        return OK;
+        else {
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r, APLOGNO(03464)
+                          "URI path '%s' matches proxy handler '%s'", r->uri,
+                          found);
+        }
+        return (encoded) ? DONE : OK;
     }
 
     return HTTP_CONTINUE;

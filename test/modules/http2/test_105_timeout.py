@@ -113,21 +113,25 @@ class TestTimeout:
 
     def test_h2_105_11(self, env):
         # short connection timeout, longer stream delay
-        # receiving the first response chunk, then timeout
+        # connection timeout must not abort ongoing streams
         conf = H2Conf(env)
         conf.add_vhost_cgi()
         conf.add("Timeout 1")
         conf.install()
         assert env.apache_restart() == 0
-        url = env.mkurl("https", "cgi", "/h2test/delay?5")
+        url = env.mkurl("https", "cgi", "/h2test/delay?1200ms")
         piper = CurlPiper(env=env, url=url)
         piper.start()
         stdout, stderr = piper.close()
-        assert len("".join(stdout)) == 8192
+        assert len("".join(stdout)) == 3 * 8192
 
     def test_h2_105_12(self, env):
         # long connection timeout, short stream timeout
         # sending a slow POST
+        if not env.curl_is_at_least('8.0.0'):
+            pytest.skip(f'need at least curl v8.0.0 for this')
+        if not env.httpd_is_at_least("2.5.0"):
+            pytest.skip(f'need at least httpd 2.5.0 for this')
         conf = H2Conf(env)
         conf.add_vhost_cgi()
         conf.add("Timeout 10")
@@ -144,5 +148,5 @@ class TestTimeout:
             except BrokenPipeError:
                 break
         piper.close()
-        assert piper.response
-        assert piper.response['status'] == 408
+        assert piper.response, f'{piper}'
+        assert piper.response['status'] == 408, f"{piper.response}"

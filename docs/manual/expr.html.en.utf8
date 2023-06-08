@@ -549,7 +549,8 @@ DIGIT       ::= &lt;any US-ASCII digit "0".."9"&gt;</pre>
             regular file)</td><td>restricted</td></tr>
 <tr><td><code>ldap</code></td>
         <td>Escape characters as required by LDAP distinguished name escaping
-            (RFC4514) and LDAP filter escaping (RFC4515).</td><td /></tr>
+            (RFC4514) and LDAP filter escaping (RFC4515).<br />
+            (Available in httpd 2.4.53 and later)</td><td /></tr>
 <tr class="odd"><td><code>replace</code></td>
         <td>replace(string, "from", "to") replaces all occurrences of "from"
             in the string with "to". The first parameter must not be a literal string.
@@ -739,7 +740,7 @@ var comments_identifier = 'http://httpd.apache.org/docs/trunk/expr.html';
     }
 })(window, document);
 //--><!]]></script></div><div id="footer">
-<p class="apache">Copyright 2021 The Apache Software Foundation.<br />Licensed under the <a href="http://www.apache.org/licenses/LICENSE-2.0">Apache License, Version 2.0</a>.</p>
+<p class="apache">Copyright 2023 The Apache Software Foundation.<br />Licensed under the <a href="http://www.apache.org/licenses/LICENSE-2.0">Apache License, Version 2.0</a>.</p>
 <p class="menu"><a href="./mod/">Modules</a> | <a href="./mod/quickreference.html">Directives</a> | <a href="http://wiki.apache.org/httpd/FAQ">FAQ</a> | <a href="./glossary.html">Glossary</a> | <a href="./sitemap.html">Sitemap</a></p></div><script type="text/javascript"><!--//--><![CDATA[//><!--
 if (typeof(prettyPrint) !== 'undefined') {
     prettyPrint();

@@ -111,6 +111,12 @@ username and password</td></tr>
     will be used. To disable fake basic authentication for an URL
     space, specify "AuthBasicFake off".</p>
 
+    <div class="note">
+    The Authorization header added by this directive is <em>not</em>
+    input into any authentication or authorization within the local 
+    server.  It is designed to be passed along to upstream servers.
+    </div>
+
     <p>In this example, we pass a fixed username and password to a
     backend server.</p>
 
@@ -280,7 +286,7 @@ var comments_identifier = 'http://httpd.apache.org/docs/trunk/mod/mod_auth_basic
     }
 })(window, document);
 //--><!]]></script></div><div id="footer">
-<p class="apache">Copyright 2021 The Apache Software Foundation.<br />Licensed under the <a href="http://www.apache.org/licenses/LICENSE-2.0">Apache License, Version 2.0</a>.</p>
+<p class="apache">Copyright 2023 The Apache Software Foundation.<br />Licensed under the <a href="http://www.apache.org/licenses/LICENSE-2.0">Apache License, Version 2.0</a>.</p>
 <p class="menu"><a href="../mod/">Modules</a> | <a href="../mod/quickreference.html">Directives</a> | <a href="http://wiki.apache.org/httpd/FAQ">FAQ</a> | <a href="../glossary.html">Glossary</a> | <a href="../sitemap.html">Sitemap</a></p></div><script type="text/javascript"><!--//--><![CDATA[//><!--
 if (typeof(prettyPrint) !== 'undefined') {
     prettyPrint();

@@ -287,7 +287,10 @@ static OCSP_RESPONSE *read_response(apr_socket_t *sd, BIO *bio, conn_rec *c,
                       "OCSP response: got %" APR_SIZE_T_FMT
                       " bytes, %" APR_SIZE_T_FMT " total", len, count);
 
-        BIO_write(bio, data, (int)len);
+        if(BIO_write(bio, data, (int)len) < 0) {
+          ap_log_cerror(APLOG_MARK, APLOG_ERR, 0, c, APLOGNO(10455)
+                      "failed to write OCSP response to BIO buffer");
+        }
         apr_bucket_delete(e);
     }
 
@@ -373,8 +376,11 @@ static STACK_OF(X509) *modssl_read_ocsp_certificates(const char *file)
     while ((x509 = PEM_read_bio_X509(bio, NULL, NULL, NULL)) != NULL) {
         if (!other_certs) {
                 other_certs = sk_X509_new_null();
-                if (!other_certs)
+                if (!other_certs) {
+                        X509_free(x509);
+                        BIO_free(bio);
                         return NULL;
+                }
         }
                 
         if (!sk_X509_push(other_certs, x509)) {

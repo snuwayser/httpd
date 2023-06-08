@@ -58,11 +58,14 @@ class TlsTestEnv(HttpdTestEnv):
     @classmethod
     def curl_supports_tls_1_3(cls) -> bool:
         if cls.CURL_SUPPORTS_TLS_1_3 is None:
-            p = subprocess.run(['curl', '--tlsv1.3', 'https://shouldneverexistreally'],
-                               stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+            # Unfortunately, there is no reliable, platform-independant
+            # way to verify that TLSv1.3 is properly supported by curl.
+            #
+            # p = subprocess.run(['curl', '--tlsv1.3', 'https://shouldneverexistreally'],
+            #                    stderr=subprocess.PIPE, stdout=subprocess.PIPE)
             # return code 6 means the site could not be resolved, but the
             # tls parameter was recognized
-            cls.CURL_SUPPORTS_TLS_1_3 = p.returncode == 6
+            cls.CURL_SUPPORTS_TLS_1_3 = False
         return cls.CURL_SUPPORTS_TLS_1_3
 
 
@@ -142,11 +145,11 @@ class TlsTestEnv(HttpdTestEnv):
     def domain_b(self) -> str:
         return self._domain_b
 
-    def tls_get(self, domain, paths: Union[str, List[str]], options: List[str] = None) -> ExecResult:
+    def tls_get(self, domain, paths: Union[str, List[str]], options: List[str] = None, no_stdout_list = False) -> ExecResult:
         if isinstance(paths, str):
             paths = [paths]
         urls = [f"https://{domain}:{self.https_port}{path}" for path in paths]
-        return self.curl_raw(urls=urls, options=options)
+        return self.curl_raw(urls=urls, options=options, no_stdout_list=no_stdout_list)
 
     def tls_get_json(self, domain: str, path: str, options=None):
         r = self.tls_get(domain=domain, paths=path, options=options)

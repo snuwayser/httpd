@@ -18,6 +18,7 @@
 #define __mod_h2__h2__
 
 #include <apr_version.h>
+#include <ap_mmn.h>
 
 struct h2_session;
 struct h2_stream;
@@ -26,10 +27,10 @@ struct h2_stream;
  * When apr pollsets can poll file descriptors (e.g. pipes),
  * we use it for polling stream input/output.
  */
-#ifdef H2_NO_POLL_STREAMS
-#define H2_POLL_STREAMS           0
+#ifdef H2_NO_PIPES
+#define H2_USE_PIPES            0
 #else
-#define H2_POLL_STREAMS           (APR_FILES_AS_SOCKETS && APR_VERSION_AT_LEAST(1,6,0))
+#define H2_USE_PIPES            (APR_FILES_AS_SOCKETS && APR_VERSION_AT_LEAST(1,6,0))
 #endif
 
 /**
@@ -113,10 +114,10 @@ typedef struct h2_session_props {
     int completed_max;     /* the highest remote stream completed */
     int emitted_count;     /* the number of local streams sent */
     int emitted_max;       /* the highest local stream id sent */
-    int error;             /* the last session error encountered */
-    const char *error_msg; /* the short message given on the error */
     unsigned int accepting : 1;     /* if the session is accepting new streams */
     unsigned int shutdown : 1;      /* if the final GOAWAY has been sent */
+    int error;             /* the last session error encountered */
+    const char *error_msg; /* the short message given on the error */
 } h2_session_props;
 
 typedef enum h2_stream_state_t {
@@ -155,7 +156,6 @@ struct h2_request {
     apr_table_t *headers;
 
     apr_time_t request_time;
-    unsigned int chunked : 1;   /* iff request body needs to be forwarded as chunked */
     apr_off_t raw_bytes;        /* RAW network bytes that generated this request - if known. */
     int http_status;            /* Store a possible HTTP status code that gets
                                  * defined before creating the dummy HTTP/1.1
@@ -170,14 +170,6 @@ struct h2_request {
  */
 #define H2_HTTP_STATUS_UNSET (0)
 
-typedef struct h2_headers h2_headers;
-struct h2_headers {
-    int         status;
-    apr_table_t *headers;
-    apr_table_t *notes;
-    apr_off_t   raw_bytes;      /* RAW network bytes that generated this request - if known. */
-};
-
 typedef apr_status_t h2_io_data_cb(void *ctx, const char *data, apr_off_t len);
 
 typedef int h2_stream_pri_cmp_fn(int stream_id1, int stream_id2, void *session);
@@ -187,5 +179,14 @@ typedef struct h2_stream *h2_stream_get_fn(struct h2_session *session, int strea
 #define H2_HDR_CONFORMANCE      "http2-hdr-conformance"
 #define H2_HDR_CONFORMANCE_UNSAFE      "unsafe"
 #define H2_PUSH_MODE_NOTE       "http2-push-mode"
+
+
+#if AP_MODULE_MAGIC_AT_LEAST(20211221, 6)
+#define AP_HAS_RESPONSE_BUCKETS     1
+
+#else /* AP_MODULE_MAGIC_AT_LEAST(20211221, 6) */
+#define AP_HAS_RESPONSE_BUCKETS     0
+
+#endif /* else AP_MODULE_MAGIC_AT_LEAST(20211221, 6) */
 
 #endif /* defined(__mod_h2__h2__) */

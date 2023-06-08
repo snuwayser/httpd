@@ -25,8 +25,7 @@
  */
 
 #include "ssl_private.h"
-#include "mod_ssl.h"
-#include "mod_ssl_openssl.h"
+
 #include "util_md5.h"
 #include "util_mutex.h"
 #include "ap_provider.h"
@@ -556,6 +555,13 @@ static int ssl_hook_ssl_bind_outgoing(conn_rec *c,
     int status;
 
     sslconn = ssl_init_connection_ctx(c, per_dir_config, 1);
+    if (sslconn->ssl) {
+        /* we are already bound to this connection. We have rebound
+         * or removed the reference to a previous per_dir_config,
+         * there is nothing more to do. */
+        return OK;
+    }
+
     status = ssl_engine_status(c, sslconn);
     if (enable_ssl) {
         if (status != OK) {

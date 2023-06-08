@@ -15,9 +15,11 @@
 #
 # Read README.cmake before using this.
 
-PROJECT(HTTPD C)
-
+# CMAKE_MINIMUM_REQUIRED should be the first directive in the file:
+# https://cmake.org/cmake/help/latest/command/cmake_minimum_required.html
 CMAKE_MINIMUM_REQUIRED(VERSION 2.8)
+
+PROJECT(HTTPD C)
 
 INCLUDE(CheckSymbolExists)
 INCLUDE(CheckCSourceCompiles)
@@ -53,6 +55,12 @@ IF(EXISTS "${CMAKE_INSTALL_PREFIX}/lib/pcre2-8d.lib")
 ELSEIF(EXISTS "${CMAKE_INSTALL_PREFIX}/lib/pcre2-8.lib")
   SET(default_pcre_libraries ${CMAKE_INSTALL_PREFIX}/lib/pcre2-8.lib)
   SET(default_pcre_cflags "-DHAVE_PCRE2")
+ELSEIF(EXISTS "${CMAKE_INSTALL_PREFIX}/lib/pcre2-8d-static.lib")
+  SET(default_pcre_libraries ${CMAKE_INSTALL_PREFIX}/lib/pcre2-8d-static.lib)
+  SET(default_pcre_cflags "-DHAVE_PCRE2 -DPCRE2_STATIC")
+ELSEIF(EXISTS "${CMAKE_INSTALL_PREFIX}/lib/pcre2-8-static.lib")
+  SET(default_pcre_libraries ${CMAKE_INSTALL_PREFIX}/lib/pcre2-8-static.lib)
+  SET(default_pcre_cflags "-DHAVE_PCRE2 -DPCRE2_STATIC")
 ELSEIF(EXISTS "${CMAKE_INSTALL_PREFIX}/lib/pcred.lib")
   SET(default_pcre_libraries ${CMAKE_INSTALL_PREFIX}/lib/pcred.lib)
 ELSE()
@@ -77,6 +85,14 @@ ELSE()
   SET(default_check_libraries)
 ENDIF()
 
+IF(EXISTS "${CMAKE_INSTALL_PREFIX}/lib/libcurl_imp.lib")
+  SET(default_curl_libraries "${CMAKE_INSTALL_PREFIX}/lib/libcurl_imp.lib")
+ELSEIF(EXISTS "${CMAKE_INSTALL_PREFIX}/lib/libcurl.lib")
+  SET(default_curl_libraries "${CMAKE_INSTALL_PREFIX}/lib/libcurl.lib")
+ELSE()
+  SET(default_curl_libraries)
+ENDIF()
+
 IF(EXISTS "${CMAKE_INSTALL_PREFIX}/lib/jansson.lib")
   SET(default_jansson_libraries "${CMAKE_INSTALL_PREFIX}/lib/jansson.lib")
 ELSE()
@@ -94,6 +110,8 @@ SET(LIBXML2_ICONV_INCLUDE_DIR     ""                     CACHE STRING "Directory
 SET(LIBXML2_ICONV_LIBRARIES       ""                     CACHE STRING "iconv libraries to link with for libxml2")
 SET(BROTLI_INCLUDE_DIR    "${CMAKE_INSTALL_PREFIX}/include" CACHE STRING "Directory with include files for Brotli")
 SET(BROTLI_LIBRARIES      ${default_brotli_libraries}    CACHE STRING "Brotli libraries to link with")
+SET(CURL_INCLUDE_DIR      "${CMAKE_INSTALL_PREFIX}/include" CACHE STRING "Directory with include files for cURL")
+SET(CURL_LIBRARIES        ${default_curl_libraries}         CACHE STRING "cURL libraries to link with")
 SET(JANSSON_INCLUDE_DIR   "${CMAKE_INSTALL_PREFIX}/include" CACHE STRING "Directory with include files for jansson")
 SET(JANSSON_LIBRARIES     "${default_jansson_libraries}" CACHE STRING "Jansson libraries to link with")
 SET(CHECK_INCLUDE_DIR     "${CMAKE_INSTALL_PREFIX}/include" CACHE STRING "Directory with include files for Check")
@@ -442,11 +460,12 @@ SET(mod_dav_extra_sources
   modules/dav/main/liveprop.c        modules/dav/main/props.c
   modules/dav/main/std_liveprop.c    modules/dav/main/providers.c
   modules/dav/main/util.c            modules/dav/main/util_lock.c
+  modules/dav/main/ms_wdv.c
 )
 SET(mod_dav_install_lib 1)
 SET(mod_dav_fs_extra_sources
   modules/dav/fs/dbm.c               modules/dav/fs/lock.c
-  modules/dav/fs/repos.c
+  modules/dav/fs/quota.c             modules/dav/fs/repos.c
 )
 SET(mod_dav_fs_extra_libs            mod_dav)
 SET(mod_dav_lock_extra_sources       modules/dav/lock/locks.c)
@@ -473,7 +492,7 @@ SET(mod_http2_extra_sources
   modules/http2/h2_c1.c              modules/http2/h2_c1_io.c
   modules/http2/h2_c2.c              modules/http2/h2_c2_filter.c
   modules/http2/h2_config.c          modules/http2/h2_conn_ctx.c
-  modules/http2/h2_headers.c         modules/http2/h2_mplx.c
+  modules/http2/h2_mplx.c            modules/http2/h2_headers.c
   modules/http2/h2_protocol.c        modules/http2/h2_push.c
   modules/http2/h2_request.c         modules/http2/h2_session.c
   modules/http2/h2_stream.c          modules/http2/h2_switch.c
@@ -512,7 +531,7 @@ SET(mod_md_extra_sources
   modules/md/md_ocsp.c               modules/md/md_util.c               
   modules/md/mod_md_config.c         modules/md/mod_md_drive.c
   modules/md/mod_md_os.c             modules/md/mod_md_status.c
-  modules/md/mod_md_ocsp.c           
+  modules/md/mod_md_ocsp.c           modules/md/md_tailscale.c
 )
 SET(mod_optional_hook_export_extra_defines AP_DECLARE_EXPORT) # bogus reuse of core API prefix
 SET(mod_proxy_extra_defines          PROXY_DECLARE_EXPORT)
@@ -651,11 +670,10 @@ ENDIF()
 CONFIGURE_FILE(os/win32/BaseAddr.ref ${PROJECT_BINARY_DIR}/ COPYONLY)
 
 ADD_EXECUTABLE(gen_test_char server/gen_test_char.c)
-GET_TARGET_PROPERTY(GEN_TEST_CHAR_EXE gen_test_char LOCATION)
 ADD_CUSTOM_COMMAND(
   COMMENT "Generating character tables, test_char.h, for current locale"
   DEPENDS gen_test_char
-  COMMAND ${GEN_TEST_CHAR_EXE} > ${PROJECT_BINARY_DIR}/test_char.h
+  COMMAND $<TARGET_FILE:gen_test_char> > ${PROJECT_BINARY_DIR}/test_char.h
   OUTPUT ${PROJECT_BINARY_DIR}/test_char.h
 )
 ADD_CUSTOM_TARGET(
@@ -699,6 +717,7 @@ SET(LIBHTTPD_SOURCES
   server/eoc_bucket.c
   server/eor_bucket.c
   server/error_bucket.c
+  server/headers_bucket.c
   server/listen.c
   server/log.c
   server/mpm/winnt/child.c
@@ -908,7 +927,10 @@ ADD_EXECUTABLE(httpd server/main.c build/win32/httpd.rc)
 SET(install_targets ${install_targets} httpd)
 SET(install_bin_pdb ${install_bin_pdb} $<TARGET_PDB_FILE:httpd>)
 DEFINE_WITH_BLANKS(define_long_name "LONG_NAME" "Apache HTTP Server")
-SET_TARGET_PROPERTIES(httpd PROPERTIES COMPILE_FLAGS "-DAPP_FILE ${define_long_name} -DBIN_NAME=httpd.exe -DICON_FILE=${CMAKE_SOURCE_DIR}/build/win32/apache.ico ${EXTRA_COMPILE_FLAGS}")
+SET_TARGET_PROPERTIES(httpd PROPERTIES
+  COMPILE_FLAGS "-DAPP_FILE ${define_long_name} -DBIN_NAME=httpd.exe -DICON_FILE=${CMAKE_SOURCE_DIR}/build/win32/apache.ico ${EXTRA_COMPILE_FLAGS}"
+  LINK_FLAGS "/stack:0x40000"
+)
 TARGET_LINK_LIBRARIES(httpd libhttpd ${EXTRA_LIBS})
 
 SET(standard_support
@@ -1102,6 +1124,8 @@ MESSAGE(STATUS "  Brotli libraries ................ : ${BROTLI_LIBRARIES}")
 MESSAGE(STATUS "  Check include directory.......... : ${CHECK_INCLUDE_DIR}")
 MESSAGE(STATUS "  Check libraries ................. : ${CHECK_LIBRARIES}")
 MESSAGE(STATUS "  Curl include directory........... : ${CURL_INCLUDE_DIR}")
+MESSAGE(STATUS "  Curl libraries .................. : ${CURL_LIBRARIES}")
+MESSAGE(STATUS "  Jansson include directory ....... : ${JANSSON_INCLUDE_DIR}")
 MESSAGE(STATUS "  Jansson libraries ............... : ${JANSSON_LIBRARIES}")
 MESSAGE(STATUS "  Extra include directories ....... : ${EXTRA_INCLUDES}")
 MESSAGE(STATUS "  Extra compile flags ............. : ${EXTRA_COMPILE_FLAGS}")

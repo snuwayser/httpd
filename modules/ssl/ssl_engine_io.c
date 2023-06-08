@@ -28,8 +28,7 @@
                                   core keeps dumping.''
                                             -- Unknown    */
 #include "ssl_private.h"
-#include "mod_ssl.h"
-#include "mod_ssl_openssl.h"
+
 #include "apr_date.h"
 
 APR_IMPLEMENT_OPTIONAL_HOOK_RUN_ALL(ssl, SSL, int, proxy_post_handshake,
@@ -192,16 +191,6 @@ static int bio_filter_destroy(BIO *bio)
     return 1;
 }
 
-static int bio_filter_out_read(BIO *bio, char *out, int outl)
-{
-    /* this is never called */
-    bio_filter_out_ctx_t *outctx = (bio_filter_out_ctx_t *)BIO_get_data(bio);
-    ap_log_cerror(APLOG_MARK, APLOG_TRACE1, 0, outctx->c,
-                  "BUG: %s() should not be called", "bio_filter_out_read");
-    AP_DEBUG_ASSERT(0);
-    return -1;
-}
-
 static int bio_filter_out_write(BIO *bio, const char *in, int inl)
 {
     bio_filter_out_ctx_t *outctx = (bio_filter_out_ctx_t *)BIO_get_data(bio);
@@ -295,26 +284,6 @@ static long bio_filter_out_ctrl(BIO *bio, int cmd, long num, void *ptr)
     }
 
     return ret;
-}
-
-static int bio_filter_out_gets(BIO *bio, char *buf, int size)
-{
-    /* this is never called */
-    bio_filter_out_ctx_t *outctx = (bio_filter_out_ctx_t *)BIO_get_data(bio);
-    ap_log_cerror(APLOG_MARK, APLOG_TRACE1, 0, outctx->c,
-                  "BUG: %s() should not be called", "bio_filter_out_gets");
-    AP_DEBUG_ASSERT(0);
-    return -1;
-}
-
-static int bio_filter_out_puts(BIO *bio, const char *str)
-{
-    /* this is never called */
-    bio_filter_out_ctx_t *outctx = (bio_filter_out_ctx_t *)BIO_get_data(bio);
-    ap_log_cerror(APLOG_MARK, APLOG_TRACE1, 0, outctx->c,
-                  "BUG: %s() should not be called", "bio_filter_out_puts");
-    AP_DEBUG_ASSERT(0);
-    return -1;
 }
 
 typedef struct {
@@ -586,33 +555,6 @@ static int bio_filter_in_read(BIO *bio, char *in, int inlen)
     return -1;
 }
 
-static int bio_filter_in_write(BIO *bio, const char *in, int inl)
-{
-    bio_filter_in_ctx_t *inctx = (bio_filter_in_ctx_t *)BIO_get_data(bio);
-    ap_log_cerror(APLOG_MARK, APLOG_TRACE1, 0, inctx->f->c,
-                  "BUG: %s() should not be called", "bio_filter_in_write");
-    AP_DEBUG_ASSERT(0);
-    return -1;
-}
-
-static int bio_filter_in_puts(BIO *bio, const char *str)
-{
-    bio_filter_in_ctx_t *inctx = (bio_filter_in_ctx_t *)BIO_get_data(bio);
-    ap_log_cerror(APLOG_MARK, APLOG_TRACE1, 0, inctx->f->c,
-                  "BUG: %s() should not be called", "bio_filter_in_puts");
-    AP_DEBUG_ASSERT(0);
-    return -1;
-}
-
-static int bio_filter_in_gets(BIO *bio, char *buf, int size)
-{
-    bio_filter_in_ctx_t *inctx = (bio_filter_in_ctx_t *)BIO_get_data(bio);
-    ap_log_cerror(APLOG_MARK, APLOG_TRACE1, 0, inctx->f->c,
-                  "BUG: %s() should not be called", "bio_filter_in_gets");
-    AP_DEBUG_ASSERT(0);
-    return -1;
-}
-
 static long bio_filter_in_ctrl(BIO *bio, int cmd, long num, void *ptr)
 {
     bio_filter_in_ctx_t *inctx = (bio_filter_in_ctx_t *)BIO_get_data(bio);
@@ -624,9 +566,8 @@ static long bio_filter_in_ctrl(BIO *bio, int cmd, long num, void *ptr)
     default:
         break;
     }
-    ap_log_cerror(APLOG_MARK, APLOG_TRACE1, 0, inctx->f->c,
-                  "BUG: bio_filter_in_ctrl() should not be called with cmd=%i",
-                  cmd);
+    ap_log_cerror(APLOG_MARK, APLOG_TRACE4, 0, inctx->f->c,
+                  "input bio: unhandled control %d", cmd);
     return 0;
 }
 
@@ -636,9 +577,9 @@ static BIO_METHOD bio_filter_out_method = {
     BIO_TYPE_MEM,
     "APR output filter",
     bio_filter_out_write,
-    bio_filter_out_read,     /* read is never called */
-    bio_filter_out_puts,     /* puts is never called */
-    bio_filter_out_gets,     /* gets is never called */
+    NULL,                    /* read is never called */
+    NULL,                    /* puts is never called */
+    NULL,                    /* gets is never called */
     bio_filter_out_ctrl,
     bio_filter_create,
     bio_filter_destroy,
@@ -648,10 +589,10 @@ static BIO_METHOD bio_filter_out_method = {
 static BIO_METHOD bio_filter_in_method = {
     BIO_TYPE_MEM,
     "APR input filter",
-    bio_filter_in_write,        /* write is never called */
+    NULL,                       /* write is never called */
     bio_filter_in_read,
-    bio_filter_in_puts,         /* puts is never called */
-    bio_filter_in_gets,         /* gets is never called */
+    NULL,                       /* puts is never called */
+    NULL,                       /* gets is never called */
     bio_filter_in_ctrl,         /* ctrl is called for EOF check */
     bio_filter_create,
     bio_filter_destroy,
@@ -667,18 +608,12 @@ void init_bio_methods(void)
 {
     bio_filter_out_method = BIO_meth_new(BIO_TYPE_MEM, "APR output filter");
     BIO_meth_set_write(bio_filter_out_method, &bio_filter_out_write);
-    BIO_meth_set_read(bio_filter_out_method, &bio_filter_out_read); /* read is never called */
-    BIO_meth_set_puts(bio_filter_out_method, &bio_filter_out_puts); /* puts is never called */
-    BIO_meth_set_gets(bio_filter_out_method, &bio_filter_out_gets); /* gets is never called */
     BIO_meth_set_ctrl(bio_filter_out_method, &bio_filter_out_ctrl);
     BIO_meth_set_create(bio_filter_out_method, &bio_filter_create);
     BIO_meth_set_destroy(bio_filter_out_method, &bio_filter_destroy);
 
     bio_filter_in_method = BIO_meth_new(BIO_TYPE_MEM, "APR input filter");
-    BIO_meth_set_write(bio_filter_in_method, &bio_filter_in_write); /* write is never called */
     BIO_meth_set_read(bio_filter_in_method, &bio_filter_in_read);
-    BIO_meth_set_puts(bio_filter_in_method, &bio_filter_in_puts);   /* puts is never called */
-    BIO_meth_set_gets(bio_filter_in_method, &bio_filter_in_gets);   /* gets is never called */
     BIO_meth_set_ctrl(bio_filter_in_method, &bio_filter_in_ctrl);   /* ctrl is never called */
     BIO_meth_set_create(bio_filter_in_method, &bio_filter_create);
     BIO_meth_set_destroy(bio_filter_in_method, &bio_filter_destroy);
@@ -2347,14 +2282,7 @@ apr_status_t ssl_io_filter_init(conn_rec *c, request_rec *r, SSL *ssl)
                               ssl_io_filter_cleanup, apr_pool_cleanup_null);
 
     if (APLOG_CS_IS_LEVEL(c, mySrvFromConn(c), APLOG_TRACE4)) {
-        BIO *rbio = SSL_get_rbio(ssl),
-            *wbio = SSL_get_wbio(ssl);
-        BIO_set_callback(rbio, ssl_io_data_cb);
-        BIO_set_callback_arg(rbio, (void *)ssl);
-        if (wbio && wbio != rbio) {
-            BIO_set_callback(wbio, ssl_io_data_cb);
-            BIO_set_callback_arg(wbio, (void *)ssl);
-        }
+        modssl_set_io_callbacks(ssl);
     }
 
     return APR_SUCCESS;
@@ -2438,13 +2366,22 @@ static void ssl_io_data_dump(conn_rec *c, server_rec *s,
             "+-------------------------------------------------------------------------+");
 }
 
-long ssl_io_data_cb(BIO *bio, int cmd,
-                    const char *argp,
-                    int argi, long argl, long rc)
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+static long modssl_io_cb(BIO *bio, int cmd, const char *argp,
+                         size_t len, int argi, long argl, int rc,
+                         size_t *processed)
+#else
+static long modssl_io_cb(BIO *bio, int cmd, const char *argp,
+                         int argi, long argl, long rc)
+#endif
 {
     SSL *ssl;
     conn_rec *c;
     server_rec *s;
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+    (void)len;
+    (void)processed;
+#endif
 
     if ((ssl = (SSL *)BIO_get_callback_arg(bio)) == NULL)
         return rc;
@@ -2466,7 +2403,7 @@ long ssl_io_data_cb(BIO *bio, int cmd,
                     "%s: %s %ld/%d bytes %s BIO#%pp [mem: %pp] %s",
                     MODSSL_LIBRARY_NAME,
                     (cmd == (BIO_CB_WRITE|BIO_CB_RETURN) ? "write" : "read"),
-                    rc, argi, (cmd == (BIO_CB_WRITE|BIO_CB_RETURN) ? "to" : "from"),
+                    (long)rc, argi, (cmd == (BIO_CB_WRITE|BIO_CB_RETURN) ? "to" : "from"),
                     bio, argp, dump);
             if (*dump != '\0' && argp != NULL)
                 ssl_io_data_dump(c, s, argp, rc);
@@ -2480,4 +2417,26 @@ long ssl_io_data_cb(BIO *bio, int cmd,
         }
     }
     return rc;
+}
+
+static APR_INLINE void set_bio_callback(BIO *bio, void *arg)
+{
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+    BIO_set_callback_ex(bio, modssl_io_cb);
+#else
+    BIO_set_callback(bio, modssl_io_cb);
+#endif
+    BIO_set_callback_arg(bio, arg);
+}
+
+void modssl_set_io_callbacks(SSL *ssl)
+{
+    BIO *rbio = SSL_get_rbio(ssl),
+        *wbio = SSL_get_wbio(ssl);
+    if (rbio) {
+        set_bio_callback(rbio, ssl);
+    }
+    if (wbio && wbio != rbio) {
+        set_bio_callback(wbio, ssl);
+    }
 }

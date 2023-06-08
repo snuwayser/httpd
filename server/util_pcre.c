@@ -55,7 +55,6 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "httpd.h"
 #include "apr_strings.h"
 #include "apr_tables.h"
-#include "apr_thread_proc.h"
 
 #ifdef HAVE_PCRE2
 #define PCRE2_CODE_UNIT_WIDTH 8
@@ -76,6 +75,17 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #ifndef POSIX_MALLOC_THRESHOLD
 #define POSIX_MALLOC_THRESHOLD (10)
+#endif
+
+#ifdef HAVE_PCRE2
+/* Reserve 128 bytes for the PCRE2 structs, that is (a bit above):
+ *   sizeof(pcre2_general_context) + offsetof(pcre2_match_data, ovector)
+ */
+#define AP_PCRE_STACKBUF_SIZE \
+    APR_ALIGN_DEFAULT(128 + POSIX_MALLOC_THRESHOLD * sizeof(PCRE2_SIZE) * 2)
+#else
+#define AP_PCRE_STACKBUF_SIZE \
+    APR_ALIGN_DEFAULT(POSIX_MALLOC_THRESHOLD * sizeof(int) * 3)
 #endif
 
 /* Table of error strings corresponding to POSIX error codes; must be
@@ -203,7 +213,7 @@ AP_DECLARE(int) ap_regcomp(ap_regex_t * preg, const char *pattern, int cflags)
 {
 #ifdef HAVE_PCRE2
     uint32_t capcount;
-    size_t erroffset;
+    PCRE2_SIZE erroffset;
 #else
     const char *errorptr;
     int erroffset;
@@ -258,139 +268,160 @@ AP_DECLARE(int) ap_regcomp(ap_regex_t * preg, const char *pattern, int cflags)
  *              Match a regular expression       *
  *************************************************/
 
-/* Unfortunately, PCRE requires 3 ints of working space for each captured
+/* Unfortunately, PCRE1 requires 3 ints of working space for each captured
  * substring, so we have to get and release working store instead of just using
  * the POSIX structures as was done in earlier releases when PCRE needed only 2
  * ints. However, if the number of possible capturing brackets is small, use a
  * block of store on the stack, to reduce the use of malloc/free. The threshold
- * is in a macro that can be changed at configure time.
- * Yet more unfortunately, PCRE2 wants an opaque context by providing the API
- * to allocate and free it, so to minimize these calls we maintain one opaque
- * context per thread (in Thread Local Storage, TLS) grown as needed, and while
- * at it we do the same for PCRE1 ints vectors. Note that this requires a fast
- * TLS mechanism to be worth it, which is the case of apr_thread_data_get/set()
- * from/to ap_thread_current() when AP_HAS_THREAD_LOCAL; otherwise we'll do
- * the allocation and freeing for each ap_regexec().
+ * is in POSIX_MALLOC_THRESHOLD macro that can be changed at configure time.
+ * PCRE2 takes an opaque match context and lets us provide the callbacks to
+ * manage the memory needed during the match, so we can still use a small stack
+ * space that will suffice for the match context struct and a single frame of
+ * POSIX_MALLOC_THRESHOLD captures, above that either use a thread local
+ * subpool cache (#if AP_HAS_THREAD_LOCAL) or fall back to malloc()/free().
  */
 
-#ifdef HAVE_PCRE2
-typedef pcre2_match_data* match_data_pt;
-typedef size_t*           match_vector_pt;
-#else
-typedef int*              match_data_pt;
-typedef int*              match_vector_pt;
-#endif
-
-static APR_INLINE
-match_data_pt alloc_match_data(apr_size_t size,
-                               match_vector_pt small_vector)
-{
-    match_data_pt data;
-
-#ifdef HAVE_PCRE2
-    data = pcre2_match_data_create(size, NULL);
-#else
-    if (size > POSIX_MALLOC_THRESHOLD) {
-        data = malloc(size * sizeof(int) * 3);
-    }
-    else {
-        data = small_vector;
-    }
-#endif
-
-    return data;
-}
-
-static APR_INLINE
-void free_match_data(match_data_pt data, apr_size_t size)
-{
-#ifdef HAVE_PCRE2
-    pcre2_match_data_free(data);
-#else
-    if (size > POSIX_MALLOC_THRESHOLD) {
-        free(data);
-    }
-#endif
-}
-
 #if AP_HAS_THREAD_LOCAL && !defined(APREG_NO_THREAD_LOCAL)
+#define APREG_USE_THREAD_LOCAL 1
+#else
+#define APREG_USE_THREAD_LOCAL 0
+#endif
 
-struct apreg_tls {
-    match_data_pt data;
-    apr_size_t size;
+#ifdef HAVE_PCRE2
+typedef PCRE2_SIZE* match_vector_pt;
+#else
+typedef int*        match_vector_pt;
+#endif
+
+#if APREG_USE_THREAD_LOCAL
+static AP_THREAD_LOCAL apr_pool_t *thread_pool;
+#endif
+
+struct match_data_state {
+    /* keep first, struct aligned */
+    char buf[AP_PCRE_STACKBUF_SIZE];
+    apr_size_t buf_used;
+
+#if APREG_USE_THREAD_LOCAL
+    apr_thread_t *thd;
+    apr_pool_t *pool;
+#endif
+
+#ifdef HAVE_PCRE2
+    pcre2_general_context *pcre2_ctx;
+    pcre2_match_data* match_data;
+#else
+    int *match_data;
+#endif
 };
 
-#ifdef HAVE_PCRE2
-static apr_status_t apreg_tls_cleanup(void *arg)
+static void * private_malloc(size_t size, void *ctx)
 {
-    struct apreg_tls *tls = arg;
-    pcre2_match_data_free(tls->data); /* NULL safe */
-    return APR_SUCCESS;
-}
-#endif
+    struct match_data_state *state = ctx;
 
-static match_data_pt get_match_data(apr_size_t size,
-                                    match_vector_pt small_vector,
-                                    int *to_free)
-{
-    apr_thread_t *current;
-    struct apreg_tls *tls = NULL;
-
-    /* Even though AP_HAS_THREAD_LOCAL, we may still be called by a
-     * native/non-apr thread, let's fall back to alloc/free in this case.
-     */
-    current = ap_thread_current();
-    if (!current) {
-        *to_free = 1;
-        return alloc_match_data(size, small_vector);
+    if (size <= sizeof(state->buf) - state->buf_used) {
+        void *p = state->buf + state->buf_used;
+        state->buf_used += APR_ALIGN_DEFAULT(size);
+        return p;
     }
 
-    apr_thread_data_get((void **)&tls, "apreg", current);
-    if (!tls || tls->size < size) {
-        apr_pool_t *tp = apr_thread_pool_get(current);
-        if (!tls) {
-            tls = apr_pcalloc(tp, sizeof(*tls));
-#ifdef HAVE_PCRE2
-            apr_thread_data_set(tls, "apreg", apreg_tls_cleanup, current);
-#else
-            apr_thread_data_set(tls, "apreg", NULL, current);
-#endif
-        }
-
-        tls->size *= 2;
-        if (tls->size < size) {
-            tls->size = size;
-            if (tls->size < POSIX_MALLOC_THRESHOLD) {
-                tls->size = POSIX_MALLOC_THRESHOLD;
+#if APREG_USE_THREAD_LOCAL
+    if (state->thd) {
+        apr_pool_t *pool = state->pool;
+        if (pool == NULL) {
+            pool = thread_pool;
+            if (pool == NULL) {
+                apr_pool_create(&pool, apr_thread_pool_get(state->thd));
+                thread_pool = pool;
             }
+            state->pool = pool;
         }
-
-#ifdef HAVE_PCRE2
-        pcre2_match_data_free(tls->data); /* NULL safe */
-        tls->data = pcre2_match_data_create(tls->size, NULL);
-        if (!tls->data) {
-            tls->size = 0;
-            return NULL;
-        }
-#else
-        tls->data = apr_palloc(tp, tls->size * sizeof(int) * 3);
+        return apr_palloc(pool, size);
+    }
 #endif
+
+    return malloc(size);
+}
+
+static void private_free(void *block, void *ctx)
+{
+    struct match_data_state *state = ctx;
+    char *p = block;
+
+    if (p >= state->buf && p < state->buf + sizeof(state->buf)) {
+        /* This block allocated from stack buffer. Do nothing. */
+        return;
     }
 
-    return tls->data;
-}
+#if APREG_USE_THREAD_LOCAL
+    if (state->thd) {
+        /* Freed in cleanup_state() eventually. */
+        return;
+    }
+#endif
 
-#else /* AP_HAS_THREAD_LOCAL && !defined(APREG_NO_THREAD_LOCAL) */
+    free(block);
+} 
 
-static APR_INLINE match_data_pt get_match_data(apr_size_t size,
-                                               match_vector_pt small_vector,
-                                               int *to_free)
+static APR_INLINE
+int setup_state(struct match_data_state *state, apr_uint32_t ncaps)
 {
-    *to_free = 1;
-    return alloc_match_data(size, small_vector);
+    state->buf_used = 0;
+
+#if APREG_USE_THREAD_LOCAL
+    state->thd = ap_thread_current();
+    state->pool = NULL;
+#endif
+
+#ifdef HAVE_PCRE2
+    state->pcre2_ctx = pcre2_general_context_create(private_malloc,
+                                                    private_free, state);
+    if (!state->pcre2_ctx) { 
+        return 0;
+    }
+
+    state->match_data = pcre2_match_data_create(ncaps, state->pcre2_ctx);
+    if (!state->match_data) {
+        pcre2_general_context_free(state->pcre2_ctx);
+        return 0;
+    }
+#else
+    if (ncaps) {
+        state->match_data = private_malloc(ncaps * sizeof(int) * 3, state);
+        if (!state->match_data) {
+            return 0;
+        }
+    }
+    else {
+        /* Fine with PCRE1 */
+        state->match_data = NULL;
+    }
+#endif
+
+    return 1;
 }
 
-#endif /* AP_HAS_THREAD_LOCAL && !defined(APREG_NO_THREAD_LOCAL) */
+static APR_INLINE
+void cleanup_state(struct match_data_state *state)
+{
+#ifdef HAVE_PCRE2
+    pcre2_match_data_free(state->match_data);
+    pcre2_general_context_free(state->pcre2_ctx);
+#else
+    if (state->match_data) {
+        private_free(state->match_data, state);
+    }
+#endif
+
+#if APREG_USE_THREAD_LOCAL
+    if (state->pool) {
+        /* Let the thread's pool allocator recycle or free according
+         * to its max_free setting.
+         */
+        apr_pool_clear(state->pool);
+    }
+#endif
+}
 
 AP_DECLARE(int) ap_regexec(const ap_regex_t *preg, const char *string,
                            apr_size_t nmatch, ap_regmatch_t *pmatch,
@@ -405,17 +436,38 @@ AP_DECLARE(int) ap_regexec_len(const ap_regex_t *preg, const char *buff,
                                ap_regmatch_t *pmatch, int eflags)
 {
     int rc;
-    int options = 0, to_free = 0;
+    int options = 0;
+    struct match_data_state state;
     match_vector_pt ovector = NULL;
-    apr_size_t ncaps = (apr_size_t)preg->re_nsub + 1;
-#ifdef HAVE_PCRE2
-    match_data_pt data = get_match_data(ncaps, NULL, &to_free);
-#else
-    int small_vector[POSIX_MALLOC_THRESHOLD * 3];
-    match_data_pt data = get_match_data(ncaps, small_vector, &to_free);
+    apr_uint32_t ncaps = (apr_uint32_t)preg->re_nsub + 1;
+
+#ifndef HAVE_PCRE2
+    /* This is fine if pcre_exec() gets a vector size smaller than the
+     * number of capturing groups (it will treat the remaining ones as
+     * non-capturing), but if the vector is too small to keep track of
+     * the potential backrefs within the pattern, it will temporarily
+     * malloc()ate the necessary space anyway. So let's provide a vector
+     * of at least PCRE_INFO_BACKREFMAX entries (likely zero, otherwise
+     * the vector is most likely cached already anyway).
+     * Note that if no captures are to be used by the caller, passing an
+     * nmatch of zero (thus forcing all groups to be non-capturing) may
+     * allow for some optimizations and/or less recursion (stack usage)
+     * with PCRE1, unless backrefs..
+     */
+    if (ncaps > nmatch) {
+        int backrefmax = 0;
+        pcre_fullinfo((const pcre *)preg->re_pcre, NULL,
+                      PCRE_INFO_BACKREFMAX, &backrefmax);
+        if (backrefmax > 0 && (apr_uint32_t)backrefmax >= nmatch) {
+            ncaps = (apr_uint32_t)backrefmax + 1;
+        }
+        else {
+            ncaps = nmatch;
+        }
+    }
 #endif
 
-    if (!data) {
+    if (!setup_state(&state, ncaps)) {
         return AP_REG_ESPACE;
     }
 
@@ -430,11 +482,11 @@ AP_DECLARE(int) ap_regexec_len(const ap_regex_t *preg, const char *buff,
 
 #ifdef HAVE_PCRE2
     rc = pcre2_match((const pcre2_code *)preg->re_pcre,
-                     (const unsigned char *)buff, len,
-                     0, options, data, NULL);
-    ovector = pcre2_get_ovector_pointer(data);
+                     (const unsigned char *)buff, len, 0, options,
+                     state.match_data, NULL);
+    ovector = pcre2_get_ovector_pointer(state.match_data);
 #else
-    ovector = data;
+    ovector = state.match_data;
     rc = pcre_exec((const pcre *)preg->re_pcre, NULL, buff, (int)len,
                    0, options, ovector, ncaps * 3);
 #endif
@@ -449,15 +501,11 @@ AP_DECLARE(int) ap_regexec_len(const ap_regex_t *preg, const char *buff,
         }
         for (; i < nmatch; i++)
             pmatch[i].rm_so = pmatch[i].rm_eo = -1;
-        if (to_free) {
-            free_match_data(data, ncaps);
-        }
+        cleanup_state(&state);
         return 0;
     }
     else {
-        if (to_free) {
-            free_match_data(data, ncaps);
-        }
+        cleanup_state(&state);
 #ifdef HAVE_PCRE2
         if (rc <= PCRE2_ERROR_UTF8_ERR1 && rc >= PCRE2_ERROR_UTF8_ERR21)
             return AP_REG_INVARG;

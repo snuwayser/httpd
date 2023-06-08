@@ -1172,6 +1172,10 @@ enum {
     DAV_PROPID_workspace,
     DAV_PROPID_workspace_checkout_set,
 
+    /* RFC 4331 quotas */
+    DAV_PROPID_quota_available_bytes,
+    DAV_PROPID_quota_used_bytes,
+
     DAV_PROPID_END
 };
 
@@ -1321,6 +1325,7 @@ struct dav_hooks_propdb
 #define DAV_TIMEOUT_INFINITE 0
 
 DAV_DECLARE(time_t) dav_get_timeout(request_rec *r);
+DAV_DECLARE(time_t) dav_get_timeout_string(request_rec *r, const char *s);
 
 /*
 ** Opaque, provider-specific information for a lock database.
@@ -1691,12 +1696,15 @@ struct dav_hooks_locks
 
 typedef struct dav_propdb dav_propdb;
 
+#define DAV_PROPDB_NONE                  0 
+#define DAV_PROPDB_RO                    1
+#define DAV_PROPDB_DISABLE_LOCKDISCOVERY 2 
 
 DAV_DECLARE(dav_error *) dav_open_propdb(
     request_rec *r,
     dav_lockdb *lockdb,
     const dav_resource *resource,
-    int ro,
+    int flags,
     apr_array_header_t *ns_xlate,
     dav_propdb **propdb);
 
@@ -1705,7 +1713,7 @@ DAV_DECLARE(dav_error *) dav_popen_propdb(
     request_rec *r,
     dav_lockdb *lockdb,
     const dav_resource *resource,
-    int ro,
+    int flags,
     apr_array_header_t *ns_xlate,
     dav_propdb **propdb);
 
@@ -2646,6 +2654,17 @@ typedef struct {
     const dav_hooks_liveprop *provider;  /* the provider defining this prop */
 } dav_elem_private;
 
+
+/* MS-WDV combined operation handler */
+DAV_DECLARE(int) dav_mswdv_preprocessing(request_rec *r);
+DAV_DECLARE(dav_error *) dav_mswdv_postprocessing(request_rec *r);
+DAV_DECLARE(apr_status_t) dav_mswdv_output(ap_filter_t *f,
+                                           apr_bucket_brigade *bb);
+DAV_DECLARE(apr_status_t) dav_mswdv_input(ap_filter_t *f,
+                                          apr_bucket_brigade *bb,
+                                          ap_input_mode_t mode,
+                                          apr_read_type_e block,
+                                          apr_off_t readbytes);
 
 /* --------------------------------------------------------------------
 **

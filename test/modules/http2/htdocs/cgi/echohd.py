@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-import cgi, os
-import cgitb; cgitb.enable()
+import os, sys
+from requestparser import get_request_params
 
-status = '200 Ok'
 
-form = cgi.FieldStorage()
-name = form.getvalue('name')
+forms, files = get_request_params()
+name = forms['name'] if 'name' in forms else None
 
 if name:
     print("Status: 200")

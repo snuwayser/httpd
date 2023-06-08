@@ -506,6 +506,11 @@ static const char *ssl_var_lookup_ssl(apr_pool_t *p, const SSLConnRec *sslconn,
     else if (ssl != NULL && strcEQ(var, "COMPRESS_METHOD")) {
         result = ssl_var_lookup_ssl_compress_meth(ssl);
     }
+    else if (ssl != NULL && strcEQ(var, "SHARED_CIPHERS")) {
+        char buf[HUGE_STRING_LEN * 2];
+        if (SSL_get_shared_ciphers(ssl, buf, sizeof(buf)))
+               result = apr_pstrdup(p, buf);
+    }
 #ifdef HAVE_TLSEXT
     else if (ssl != NULL && strcEQ(var, "TLS_SNI")) {
         result = apr_pstrdup(p, SSL_get_servername(ssl,
@@ -843,6 +848,7 @@ static const char *ssl_var_lookup_ssl_cert_chain(apr_pool_t *p, STACK_OF(X509) *
 static const char *ssl_var_lookup_ssl_cert_rfc4523_cea(apr_pool_t *p, SSL *ssl)
 {
     char *result;
+    char *decimal;
     X509 *xs;
 
     ASN1_INTEGER *serialNumber;
@@ -858,7 +864,11 @@ static const char *ssl_var_lookup_ssl_cert_rfc4523_cea(apr_pool_t *p, SSL *ssl)
         X509_NAME *issuer = X509_get_issuer_name(xs);
         if (issuer) {
             BIGNUM *bn = ASN1_INTEGER_to_BN(serialNumber, NULL);
-            char *decimal = BN_bn2dec(bn);
+            if((decimal = BN_bn2dec(bn)) == NULL) {
+              BN_free(bn);
+              X509_free(xs);
+              return NULL;
+            }
             result = apr_pstrcat(p, "{ serialNumber ", decimal,
                     ", issuer rdnSequence:\"",
                     modssl_X509_NAME_to_string(p, issuer, 0), "\" }", NULL);
@@ -1103,6 +1113,10 @@ static int dump_extn_value(BIO *bio, ASN1_OCTET_STRING *str)
     const unsigned char *pp = str->data;
     ASN1_STRING *ret = ASN1_STRING_new();
     int rv = 0;
+
+    if(!ret) {
+      return rv;
+    }
 
     /* This allows UTF8String, IA5String, VisibleString, or BMPString;
      * conversion to UTF-8 is forced. */

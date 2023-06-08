@@ -125,27 +125,6 @@ static int h2_post_config(apr_pool_t *p, apr_pool_t *plog,
                  myfeats.dyn_windows? "+DWINS"  : "",
                  ngh2?                ngh2->version_str : "unknown");
     
-    switch (h2_conn_mpm_type()) {
-        case H2_MPM_SIMPLE:
-        case H2_MPM_MOTORZ:
-        case H2_MPM_NETWARE:
-        case H2_MPM_WINNT:
-            /* not sure we need something extra for those. */
-            break;
-        case H2_MPM_EVENT:
-        case H2_MPM_WORKER:
-            /* all fine, we know these ones */
-            break;
-        case H2_MPM_PREFORK:
-            /* ok, we now know how to handle that one */
-            break;
-        case H2_MPM_UNKNOWN:
-            /* ??? */
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, APLOGNO(03091)
-                         "post_config: mpm type unknown");
-            break;
-    }
-    
     if (!h2_mpm_supported() && !mpm_warned) {
         mpm_warned = 1;
         ap_log_error(APLOG_MARK, APLOG_WARNING, 0, s, APLOGNO(10034)
@@ -171,7 +150,9 @@ static int http2_is_h2(conn_rec *);
 
 static void http2_get_num_workers(server_rec *s, int *minw, int *maxw)
 {
-    h2_get_num_workers(s, minw, maxw);
+    apr_time_t tdummy;
+
+    h2_get_workers_config(s, minw, maxw, &tdummy);
 }
 
 /* Runs once per created child process. Perform any process 
@@ -179,24 +160,7 @@ static void http2_get_num_workers(server_rec *s, int *minw, int *maxw)
  */
 static void h2_child_init(apr_pool_t *pchild, server_rec *s)
 {
-    apr_allocator_t *allocator;
-    apr_thread_mutex_t *mutex;
     apr_status_t rv;
-
-    /* The allocator of pchild has no mutex with MPM prefork, but we need one
-     * for h2 workers threads synchronization. Even though mod_http2 shouldn't
-     * be used with prefork, better be safe than sorry, so forcibly set the
-     * mutex here. For MPM event/worker, pchild has no allocator so pconf's
-     * is used, with its mutex.
-     */
-    allocator = apr_pool_allocator_get(pchild);
-    if (allocator) {
-        mutex = apr_allocator_mutex_get(allocator);
-        if (!mutex) {
-            apr_thread_mutex_create(&mutex, APR_THREAD_MUTEX_DEFAULT, pchild);
-            apr_allocator_mutex_set(allocator, mutex);
-        }
-    }
 
     /* Set up our connection processing */
     rv = h2_c1_child_init(pchild, s);
@@ -316,7 +280,7 @@ static const char *val_H2_STREAM_ID(apr_pool_t *p, server_rec *s,
                                     conn_rec *c, request_rec *r, h2_conn_ctx_t *ctx)
 {
     const char *cp = val_H2_STREAM_TAG(p, s, c, r, ctx);
-    if (cp && (cp = ap_strchr_c(cp, '-'))) {
+    if (cp && (cp = ap_strrchr_c(cp, '-'))) {
         return ++cp;
     }
     return NULL;
@@ -353,7 +317,7 @@ static int http2_is_h2(conn_rec *c)
 static char *http2_var_lookup(apr_pool_t *p, server_rec *s,
                               conn_rec *c, request_rec *r, char *name)
 {
-    int i;
+    unsigned int i;
     /* If the # of vars grow, we need to put definitions in a hash */
     for (i = 0; i < H2_ALEN(H2_VARS); ++i) {
         h2_var_def *vdef = &H2_VARS[i];
@@ -370,9 +334,8 @@ static int h2_h2_fixups(request_rec *r)
 {
     if (r->connection->master) {
         h2_conn_ctx_t *ctx = h2_conn_ctx_get(r->connection);
-        int i;
-        apr_interval_time_t stream_timeout;
-        
+        unsigned int i;
+
         for (i = 0; ctx && i < H2_ALEN(H2_VARS); ++i) {
             h2_var_def *vdef = &H2_VARS[i];
             if (vdef->subprocess) {
@@ -380,10 +343,6 @@ static int h2_h2_fixups(request_rec *r)
                                vdef->lookup(r->pool, r->server, r->connection, 
                                             r, ctx));
             }
-        }
-        stream_timeout = h2_config_geti64(r, r->server, H2_CONF_STREAM_TIMEOUT);
-        if (stream_timeout > 0) {
-            h2_conn_ctx_set_timeout(ctx, stream_timeout);
         }
     }
     return DECLINED;

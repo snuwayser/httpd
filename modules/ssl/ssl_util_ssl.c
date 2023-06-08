@@ -187,12 +187,16 @@ BOOL modssl_X509_getBC(X509 *cert, int *ca, int *pathlen)
 
 char *modssl_bio_free_read(apr_pool_t *p, BIO *bio)
 {
-    int len = BIO_pending(bio);
+    int len = BIO_pending(bio), tmp;
     char *result = NULL;
 
     if (len > 0) {
         result = apr_palloc(p, len+1);
-        len = BIO_read(bio, result, len);
+        tmp = len;
+        if ((len = BIO_read(bio, result, len)) != tmp) {
+            BIO_free(bio);
+            return NULL;
+        }
         result[len] = NUL;
     }
     BIO_free(bio);
@@ -236,7 +240,7 @@ char *modssl_X509_NAME_to_string(apr_pool_t *p, X509_NAME *dn, int maxlen)
 {
     char *result = NULL;
     BIO *bio;
-    int len;
+    int len, tmp;
 
     if ((bio = BIO_new(BIO_s_mem())) == NULL)
         return NULL;
@@ -245,13 +249,20 @@ char *modssl_X509_NAME_to_string(apr_pool_t *p, X509_NAME *dn, int maxlen)
     if (len > 0) {
         result = apr_palloc(p, (maxlen > 0) ? maxlen+1 : len+1);
         if (maxlen > 0 && maxlen < len) {
-            len = BIO_read(bio, result, maxlen);
+            if ((len = BIO_read(bio, result, maxlen)) != maxlen) {
+                BIO_free(bio);
+                return NULL;
+            }
             if (maxlen > 2) {
                 /* insert trailing ellipsis if there's enough space */
                 apr_snprintf(result + maxlen - 3, 4, "...");
             }
         } else {
-            len = BIO_read(bio, result, len);
+            tmp = len;
+            if ((len = BIO_read(bio, result, len)) != tmp) {
+                BIO_free(bio);
+                return NULL;
+            }
         }
         result[len] = NUL;
     }
@@ -464,29 +475,52 @@ BOOL modssl_X509_match_name(apr_pool_t *p, X509 *x509, const char *name,
 **  _________________________________________________________________
 */
 
-DH *ssl_dh_GetParamFromFile(const char *file)
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+DH *modssl_dh_from_file(const char *file)
 {
-    DH *dh = NULL;
+    DH *dh;
     BIO *bio;
 
     if ((bio = BIO_new_file(file, "r")) == NULL)
         return NULL;
     dh = PEM_read_bio_DHparams(bio, NULL, NULL, NULL);
     BIO_free(bio);
-    return (dh);
-}
 
-#ifdef HAVE_ECC
-EC_GROUP *ssl_ec_GetParamFromFile(const char *file)
+    return dh;
+}
+#else
+EVP_PKEY *modssl_dh_pkey_from_file(const char *file)
 {
-    EC_GROUP *group = NULL;
+    EVP_PKEY *pkey;
     BIO *bio;
 
     if ((bio = BIO_new_file(file, "r")) == NULL)
         return NULL;
-    group = PEM_read_bio_ECPKParameters(bio, NULL, NULL, NULL);
+    pkey = PEM_read_bio_Parameters(bio, NULL);
     BIO_free(bio);
-    return (group);
+
+    return pkey;
+}
+#endif
+
+#ifdef HAVE_ECC
+EC_GROUP *modssl_ec_group_from_file(const char *file)
+{
+    EC_GROUP *group;
+    BIO *bio;
+
+    if ((bio = BIO_new_file(file, "r")) == NULL)
+        return NULL;
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    group = PEM_read_bio_ECPKParameters(bio, NULL, NULL, NULL);
+#else
+    group = PEM_ASN1_read_bio((void *)d2i_ECPKParameters,
+                              PEM_STRING_ECPARAMETERS, bio,
+                              NULL, NULL, NULL);
+#endif
+    BIO_free(bio);
+
+    return group;
 }
 #endif
 

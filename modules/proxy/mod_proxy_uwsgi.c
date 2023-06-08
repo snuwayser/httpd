@@ -84,10 +84,29 @@ static int uwsgi_canon(request_rec *r, char *url)
         host = apr_pstrcat(r->pool, "[", host, "]", NULL);
     }
 
-    path = ap_proxy_canonenc(r->pool, url, strlen(url), enc_path, 0,
-                             r->proxyreq);
-    if (!path) {
-        return HTTP_BAD_REQUEST;
+    if (apr_table_get(r->notes, "proxy-nocanon")
+        || apr_table_get(r->notes, "proxy-noencode")) {
+        path = url;   /* this is the raw/encoded path */
+    }
+    else {
+        core_dir_config *d = ap_get_core_module_config(r->per_dir_config);
+        int flags = d->allow_encoded_slashes && !d->decode_encoded_slashes ? PROXY_CANONENC_NOENCODEDSLASHENCODING : 0;
+
+        path = ap_proxy_canonenc_ex(r->pool, url, strlen(url), enc_path, flags,
+                                    r->proxyreq);
+        if (!path) {
+            return HTTP_BAD_REQUEST;
+        }
+    }
+    /*
+     * If we have a raw control character or a ' ' in nocanon path,
+     * correct encoding was missed.
+     */
+    if (path == url && *ap_scan_vchar_obstext(path)) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(10417)
+                      "To be forwarded path contains control "
+                      "characters or spaces");
+        return HTTP_FORBIDDEN;
     }
 
     r->filename =
@@ -307,18 +326,16 @@ static int uwsgi_response(request_rec *r, proxy_conn_rec * backend,
     pass_bb = apr_brigade_create(r->pool, c->bucket_alloc);
 
     len = ap_getline(buffer, sizeof(buffer), rp, 1);
-
     if (len <= 0) {
-        /* oops */
+        /* invalid or empty */
         return HTTP_INTERNAL_SERVER_ERROR;
     }
-
     backend->worker->s->read += len;
-
-    if (len >= sizeof(buffer) - 1) {
-        /* oops */
+    if ((apr_size_t)len >= sizeof(buffer)) {
+        /* too long */
         return HTTP_INTERNAL_SERVER_ERROR;
     }
+
     /* Position of http status code */
     if (apr_date_checkmask(buffer, "HTTP/#.# ###*")) {
         status_start = 9;
@@ -327,8 +344,8 @@ static int uwsgi_response(request_rec *r, proxy_conn_rec * backend,
         status_start = 7;
     }
     else {
-        /* oops */
-        return HTTP_INTERNAL_SERVER_ERROR;
+        /* not HTTP */
+        return HTTP_BAD_GATEWAY;
     }
     status_end = status_start + 3;
 
@@ -348,20 +365,43 @@ static int uwsgi_response(request_rec *r, proxy_conn_rec * backend,
     }
     r->status_line = apr_pstrdup(r->pool, &buffer[status_start]);
 
-    /* start parsing headers */
+    /* parse headers */
     while ((len = ap_getline(buffer, sizeof(buffer), rp, 1)) > 0) {
+        if ((apr_size_t)len >= sizeof(buffer)) {
+            /* too long */
+            len = -1;
+            break;
+        }
         value = strchr(buffer, ':');
-        /* invalid header skip */
-        if (!value)
-            continue;
-        *value = '\0';
-        ++value;
+        if (!value) {
+            /* invalid header */
+            len = -1;
+            break;
+        }
+        *value++ = '\0';
+        if (*ap_scan_http_token(buffer)) {
+            /* invalid name */
+            len = -1;
+            break;
+        }
         while (apr_isspace(*value))
             ++value;
         for (end = &value[strlen(value) - 1];
              end > value && apr_isspace(*end); --end)
             *end = '\0';
+        if (*ap_scan_http_field_content(value)) {
+            /* invalid value */
+            len = -1;
+            break;
+        }
         apr_table_add(r->headers_out, buffer, value);
+    }
+    if (len < 0) {
+        /* Reset headers, but not to NULL because things below the chain expect
+         * this to be non NULL e.g. the ap_content_length_filter.
+         */
+        r->headers_out = apr_table_make(r->pool, 1);
+        return HTTP_BAD_GATEWAY;
     }
 
     if ((buf = apr_table_get(r->headers_out, "Content-Type"))) {

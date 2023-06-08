@@ -31,11 +31,6 @@
 #include <unistd.h>         /* for getpid() */
 #endif
 
-#if (APR_MAJOR_VERSION < 1)
-#undef apr_socket_create
-#define apr_socket_create apr_socket_create_ex
-#endif
-
 #if APR_HAVE_SYS_UN_H
 #include <sys/un.h>
 #endif
@@ -205,14 +200,16 @@ PROXY_DECLARE(void) ap_proxy_c2hex(int ch, char *x)
  * and encodes those which must be encoded, and does not touch
  * those which must not be touched.
  */
-PROXY_DECLARE(char *)ap_proxy_canonenc(apr_pool_t *p, const char *x, int len,
-                                       enum enctype t, int forcedec,
-                                       int proxyreq)
+PROXY_DECLARE(char *)ap_proxy_canonenc_ex(apr_pool_t *p, const char *x, int len,
+                                          enum enctype t, int flags,
+                                          int proxyreq)
 {
     int i, j, ch;
     char *y;
     char *allowed;  /* characters which should not be encoded */
     char *reserved; /* characters which much not be en/de-coded */
+    int forcedec = flags & PROXY_CANONENC_FORCEDEC;
+    int noencslashesenc = flags & PROXY_CANONENC_NOENCODEDSLASHENCODING;
 
 /*
  * N.B. in addition to :@&=, this allows ';' in an http path
@@ -261,16 +258,38 @@ PROXY_DECLARE(char *)ap_proxy_canonenc(apr_pool_t *p, const char *x, int len,
  * decode it if not already done. do not decode reverse proxied URLs
  * unless specifically forced
  */
-        if ((forcedec || (proxyreq && proxyreq != PROXYREQ_REVERSE)) && ch == '%') {
-            if (!apr_isxdigit(x[i + 1]) || !apr_isxdigit(x[i + 2])) {
-                return NULL;
+        if ((forcedec || noencslashesenc
+            || (proxyreq && proxyreq != PROXYREQ_REVERSE)) && ch == '%') {
+            if (apr_isxdigit(x[i + 1]) && apr_isxdigit(x[i + 2])) {
+                ch = ap_proxy_hex2c(&x[i + 1]);
+                if (ch != 0 && strchr(reserved, ch)) {  /* keep it encoded */
+                    y[j++] = x[i++];
+                    y[j++] = x[i++];
+                    y[j] = x[i];
+                    continue;
+                }
+                if (noencslashesenc && !forcedec && (proxyreq == PROXYREQ_REVERSE)) {
+                    /*
+                     * In the reverse proxy case when we only want to keep encoded
+                     * slashes untouched revert back to '%' which will cause
+                     * '%' to be encoded in the following.
+                     */
+                    ch = '%';
+                }
+                else {
+                    i += 2;
+                }
             }
-            ch = ap_proxy_hex2c(&x[i + 1]);
-            i += 2;
-            if (ch != 0 && strchr(reserved, ch)) {  /* keep it encoded */
-                ap_proxy_c2hex(ch, &y[j]);
-                j += 2;
-                continue;
+            /*
+             * In the reverse proxy case when we only want to keep encoded
+             * slashes untouched we can have decoded '%''s in the URI that got
+             * sent to us in the original URL as %25.
+             * Don't error out in this case but just fall through and have them
+             * encoded to %25 when forwarding to the backend.
+             */
+            else if (!noencslashesenc || forcedec
+                     || (proxyreq && proxyreq != PROXYREQ_REVERSE)) {
+                return NULL;
             }
         }
 /* recode it, if necessary */
@@ -284,6 +303,22 @@ PROXY_DECLARE(char *)ap_proxy_canonenc(apr_pool_t *p, const char *x, int len,
     }
     y[j] = '\0';
     return y;
+}
+
+/*
+ * Convert a URL-encoded string to canonical form.
+ * It decodes characters which need not be encoded,
+ * and encodes those which must be encoded, and does not touch
+ * those which must not be touched.
+ */
+PROXY_DECLARE(char *)ap_proxy_canonenc(apr_pool_t *p, const char *x, int len,
+                                       enum enctype t, int forcedec,
+                                       int proxyreq)
+{
+    int flags;
+
+    flags = forcedec ? PROXY_CANONENC_FORCEDEC : 0;
+    return ap_proxy_canonenc_ex(p, x, len, t, flags, proxyreq);
 }
 
 /*
@@ -820,6 +855,7 @@ PROXY_DECLARE(int) ap_proxy_checkproxyblock(request_rec *r, proxy_server_conf *c
 PROXY_DECLARE(int) ap_proxy_pre_http_request(conn_rec *c, request_rec *r)
 {
     ap_add_input_filter("HTTP_IN", NULL, r, c);
+    ap_add_input_filter("HTTP1_BODY_IN", NULL, r, c);
     return OK;
 }
 
@@ -1848,6 +1884,7 @@ PROXY_DECLARE(char *) ap_proxy_define_worker_ex(apr_pool_t *p,
     proxy_worker_shared *wshared;
     const char *ptr = NULL, *sockpath = NULL, *pdollars = NULL;
     apr_port_t port_of_scheme;
+    int disable_reuse = 0;
     apr_uri_t uri;
 
     /*
@@ -1876,12 +1913,21 @@ PROXY_DECLARE(char *) ap_proxy_define_worker_ex(apr_pool_t *p,
          * to fail (e.g. "ProxyPassMatch ^/(a|b)(/.*)? http://host:port$2").
          * So we trim all the $n from the :port and prepend them in uri.path
          * afterward for apr_uri_unparse() to restore the original URL below.
+         * If a dollar substitution is found in the hostname[:port] part of
+         * the URL, reusing address and connections in the same worker is not
+         * possible (the current implementation of active connections cache
+         * handles/assumes a single origin server:port per worker only), so
+         * we set disable_reuse here during parsing to take that into account
+         * in the worker settings below.
          */
 #define IS_REF(x) (x[0] == '$' && apr_isdigit(x[1]))
         const char *pos = ap_strstr_c(ptr, "://");
         if (pos) {
             pos += 3;
             while (*pos && *pos != ':' && *pos != '/') {
+                if (*pos == '$') {
+                    disable_reuse = 1;
+                }
                 pos++;
             }
             if (*pos == ':') {
@@ -1901,6 +1947,7 @@ PROXY_DECLARE(char *) ap_proxy_define_worker_ex(apr_pool_t *p,
                     vec[1].iov_base = (void *)path;
                     vec[1].iov_len = strlen(path);
                     ptr = apr_pstrcatv(p, vec, 2, NULL);
+                    disable_reuse = 1;
                 }
             }
         }
@@ -1991,7 +2038,7 @@ PROXY_DECLARE(char *) ap_proxy_define_worker_ex(apr_pool_t *p,
     wshared->port = (uri.port) ? uri.port : port_of_scheme;
     wshared->flush_packets = flush_off;
     wshared->flush_wait = PROXY_FLUSH_WAIT;
-    wshared->is_address_reusable = 1;
+    wshared->is_address_reusable = !disable_reuse;
     wshared->lbfactor = 100;
     wshared->passes = 1;
     wshared->fails = 1;
@@ -2000,7 +2047,31 @@ PROXY_DECLARE(char *) ap_proxy_define_worker_ex(apr_pool_t *p,
     wshared->hash.def = ap_proxy_hashfunc(wshared->name, PROXY_HASHFUNC_DEFAULT);
     wshared->hash.fnv = ap_proxy_hashfunc(wshared->name, PROXY_HASHFUNC_FNV);
     wshared->was_malloced = (mask & AP_PROXY_WORKER_IS_MALLOCED) != 0;
-    wshared->is_name_matchable = 0;
+    if (mask & AP_PROXY_WORKER_IS_MATCH) {
+        wshared->is_name_matchable = 1;
+
+        /* Before AP_PROXY_WORKER_IS_MATCH (< 2.4.47), a regex worker with
+         * dollar substitution was never matched against any actual URL, thus
+         * the requests fell through the generic worker. Now if a ProyPassMatch
+         * matches, a worker (and its parameters) is always used to determine
+         * the properties of the connection with the origin server. So for
+         * instance the same "timeout=" will be enforced for all the requests
+         * matched by the same ProyPassMatch worker, which is an improvement
+         * compared to the global/vhost [Proxy]Timeout applied by the generic
+         * worker. Likewise, address and connection reuse is the default for
+         * a ProyPassMatch worker with no dollar substitution, just like a
+         * "normal" worker. However to avoid DNS and connection reuse compat
+         * issues, connection reuse is disabled by default if there is any
+         * substitution in the uri-path (an explicit enablereuse=on can still
+         * opt-in), and reuse is even disabled definitively for substitutions
+         * happening in the hostname[:port] (disable_reuse was set above so
+         * address reuse is also disabled which will prevent enablereuse=on
+         * to apply anyway).
+         */
+        if (disable_reuse || ap_strchr_c(wshared->name, '$')) {
+            wshared->disablereuse = 1;
+        }
+    }
     if (sockpath) {
         if (PROXY_STRNCPY(wshared->uds_path, sockpath) != APR_SUCCESS) {
             return apr_psprintf(p, "worker uds path (%s) too long", sockpath);
@@ -2019,20 +2090,6 @@ PROXY_DECLARE(char *) ap_proxy_define_worker_ex(apr_pool_t *p,
     (*worker)->cp = NULL;
     (*worker)->balancer = balancer;
     (*worker)->s = wshared;
-
-    if (mask & AP_PROXY_WORKER_IS_MATCH) {
-        (*worker)->s->is_name_matchable = 1;
-        if (ap_strchr_c((*worker)->s->name, '$')) {
-            /* Before AP_PROXY_WORKER_IS_MATCH (< 2.4.47), a regex worker
-             * with dollar substitution was never matched against the actual
-             * URL thus the request fell through the generic worker. To avoid
-             * dns and connection reuse compat issues, let's disable connection
-             * reuse by default, it can still be overwritten by an explicit
-             * enablereuse=on.
-             */
-            (*worker)->s->disablereuse = 1;
-        }
-    }
 
     return NULL;
 }
@@ -2119,12 +2176,22 @@ PROXY_DECLARE(apr_status_t) ap_proxy_initialize_worker(proxy_worker *worker, ser
         if (!worker->s->retry_set) {
             worker->s->retry = apr_time_from_sec(PROXY_WORKER_DEFAULT_RETRY);
         }
-        /* By default address is reusable unless DisableReuse is set */
+        /* Consistently set address and connection reusabilty: when reuse
+         * is disabled by configuration, or when the address is known already
+         * to not be reusable for this worker (in any case, thus ignore/force
+         * DisableReuse).
+         */
         if (worker->s->disablereuse) {
             worker->s->is_address_reusable = 0;
         }
-        else {
-            worker->s->is_address_reusable = 1;
+        else if (!worker->s->is_address_reusable) {
+            /* Explicit enablereuse=on can't work in this case, warn user. */
+            if (worker->s->disablereuse_set && !worker->s->disablereuse) {
+                ap_log_error(APLOG_MARK, APLOG_WARNING, 0, s, APLOGNO(10400)
+                             "enablereuse/disablereuse ignored for worker %s",
+                             ap_proxy_worker_name(p, worker));
+            }
+            worker->s->disablereuse = 1;
         }
 
         /*
@@ -2204,9 +2271,9 @@ PROXY_DECLARE(apr_status_t) ap_proxy_initialize_worker(proxy_worker *worker, ser
                                         worker, worker->cp->pool);
 
                 ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, APLOGNO(00930)
-                    "initialized pool in child %" APR_PID_T_FMT " for (%s) min=%d max=%d smax=%d",
-                     getpid(), worker->s->hostname_ex, worker->s->min,
-                     worker->s->hmax, worker->s->smax);
+                    "initialized pool in child %" APR_PID_T_FMT " for (%s:%d) min=%d max=%d smax=%d",
+                     getpid(), worker->s->hostname_ex, (int)worker->s->port,
+                     worker->s->min, worker->s->hmax, worker->s->smax);
 
                 /* Set the acquire timeout */
                 if (rv == APR_SUCCESS && worker->s->acquire_set) {
@@ -2221,8 +2288,9 @@ PROXY_DECLARE(apr_status_t) ap_proxy_initialize_worker(proxy_worker *worker, ser
                 worker->cp->conn = conn;
 
                 ap_log_error(APLOG_MARK, APLOG_DEBUG, rv, s, APLOGNO(00931)
-                     "initialized single connection worker in child %" APR_PID_T_FMT " for (%s)",
-                     getpid(), worker->s->hostname_ex);
+                     "initialized single connection worker in child %" APR_PID_T_FMT " for (%s:%d)",
+                     getpid(), worker->s->hostname_ex,
+                     (int)worker->s->port);
             }
             if (rv == APR_SUCCESS) {
                 worker->local_status |= (PROXY_WORKER_INITIALIZED);
@@ -2243,8 +2311,9 @@ static int ap_proxy_retry_worker(const char *proxy_function, proxy_worker *worke
     if (worker->s->status & PROXY_WORKER_IN_ERROR) {
         if (PROXY_WORKER_IS(worker, PROXY_WORKER_STOPPED)) {
             ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, APLOGNO(3305)
-                         "%s: Won't retry worker (%s): stopped",
-                         proxy_function, worker->s->hostname_ex);
+                         "%s: Won't retry worker (%s:%d): stopped",
+                         proxy_function, worker->s->hostname_ex,
+                         (int)worker->s->port);
             return DECLINED;
         }
         if ((worker->s->status & PROXY_WORKER_IGNORE_ERRORS)
@@ -2252,14 +2321,16 @@ static int ap_proxy_retry_worker(const char *proxy_function, proxy_worker *worke
             ++worker->s->retries;
             worker->s->status &= ~PROXY_WORKER_IN_ERROR;
             ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, APLOGNO(00932)
-                         "%s: worker for (%s) has been marked for retry",
-                         proxy_function, worker->s->hostname_ex);
+                         "%s: worker for (%s:%d) has been marked for retry",
+                         proxy_function, worker->s->hostname_ex,
+                         (int)worker->s->port);
             return OK;
         }
         else {
             ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, APLOGNO(00933)
-                         "%s: too soon to retry worker for (%s)",
-                         proxy_function, worker->s->hostname_ex);
+                         "%s: too soon to retry worker for (%s:%d)",
+                         proxy_function, worker->s->hostname_ex,
+                         (int)worker->s->port);
             return DECLINED;
         }
     }
@@ -2494,8 +2565,9 @@ PROXY_DECLARE(int) ap_proxy_acquire_connection(const char *proxy_function,
 
         if (!PROXY_WORKER_IS_USABLE(worker)) {
             ap_log_error(APLOG_MARK, APLOG_ERR, 0, s, APLOGNO(00940)
-                         "%s: disabled connection for (%s)",
-                         proxy_function, worker->s->hostname_ex);
+                         "%s: disabled connection for (%s:%d)",
+                         proxy_function, worker->s->hostname_ex,
+                         (int)worker->s->port);
             return HTTP_SERVICE_UNAVAILABLE;
         }
     }
@@ -2517,13 +2589,15 @@ PROXY_DECLARE(int) ap_proxy_acquire_connection(const char *proxy_function,
 
     if (rv != APR_SUCCESS) {
         ap_log_error(APLOG_MARK, APLOG_ERR, rv, s, APLOGNO(00941)
-                     "%s: failed to acquire connection for (%s)",
-                     proxy_function, worker->s->hostname_ex);
+                     "%s: failed to acquire connection for (%s:%d)",
+                     proxy_function, worker->s->hostname_ex,
+                     (int)worker->s->port);
         return HTTP_SERVICE_UNAVAILABLE;
     }
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, APLOGNO(00942)
-                 "%s: has acquired connection for (%s)",
-                 proxy_function, worker->s->hostname_ex);
+                 "%s: has acquired connection for (%s:%d)",
+                 proxy_function, worker->s->hostname_ex,
+                 (int)worker->s->port);
 
     (*conn)->worker = worker;
     (*conn)->close  = 0;
@@ -2537,8 +2611,9 @@ PROXY_DECLARE(int) ap_proxy_release_connection(const char *proxy_function,
                                                server_rec *s)
 {
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, APLOGNO(00943)
-                "%s: has released connection for (%s)",
-                proxy_function, conn->worker->s->hostname_ex);
+                "%s: has released connection for (%s:%d)",
+                proxy_function, conn->worker->s->hostname_ex,
+                (int)conn->worker->s->port);
     connection_cleanup(conn);
 
     return OK;
@@ -2696,8 +2771,16 @@ ap_proxy_determine_connection(apr_pool_t *p, request_rec *r,
             /*
              * Looking up the backend address for the worker only makes sense if
              * we can reuse the address.
+             *
+             * As we indicate in the comment below that for retriggering a DNS
+             * lookup worker->cp->addr should be set to NULL we need to avoid
+             * a race that worker->cp->addr switches to NULL after we checked
+             * it to be non NULL but before we assign it to conn->addr in an
+             * else tree which would leave it to NULL and likely cause a
+             * segfault later.
              */
-            if (!worker->cp->addr) {
+            conn->addr = worker->cp->addr;
+            if (!conn->addr) {
                 if ((err = PROXY_THREAD_LOCK(worker)) != APR_SUCCESS) {
                     ap_log_rerror(APLOG_MARK, APLOG_ERR, err, r, APLOGNO(00945) "lock");
                     return HTTP_INTERNAL_SERVER_ERROR;
@@ -2707,7 +2790,8 @@ ap_proxy_determine_connection(apr_pool_t *p, request_rec *r,
                  * Recheck addr after we got the lock. This may have changed
                  * while waiting for the lock.
                  */
-                if (!AP_VOLATILIZE_T(apr_sockaddr_t *, worker->cp->addr)) {
+                conn->addr = AP_VOLATILIZE_T(apr_sockaddr_t *, worker->cp->addr);
+                if (!conn->addr) {
 
                     apr_sockaddr_t *addr;
 
@@ -2716,20 +2800,21 @@ ap_proxy_determine_connection(apr_pool_t *p, request_rec *r,
                      * The single DNS lookup is used once per worker.
                      * If dynamic change is needed then set the addr to NULL
                      * inside dynamic config to force the lookup.
+                     *
+                     * Clear the dns_pool before to avoid a memory leak in case
+                     * we did the lookup already in the past.
                      */
+                    apr_pool_clear(worker->cp->dns_pool);
                     err = apr_sockaddr_info_get(&addr,
                                                 conn->hostname, APR_UNSPEC,
                                                 conn->port, 0,
                                                 worker->cp->dns_pool);
+                    conn->addr = addr;
                     worker->cp->addr = addr;
                 }
-                conn->addr = worker->cp->addr;
                 if ((uerr = PROXY_THREAD_UNLOCK(worker)) != APR_SUCCESS) {
                     ap_log_rerror(APLOG_MARK, APLOG_ERR, uerr, r, APLOGNO(00946) "unlock");
                 }
-            }
-            else {
-                conn->addr = worker->cp->addr;
             }
         }
     }
@@ -3131,6 +3216,7 @@ PROXY_DECLARE(int) ap_proxy_connect_backend(const char *proxy_function,
     apr_sockaddr_t *local_addr;
     apr_socket_t *newsock;
     void *sconf = s->module_config;
+    int did_dns_lookup = 0;
     proxy_server_conf *conf =
         (proxy_server_conf *) ap_get_module_config(sconf, &proxy_module);
 
@@ -3149,9 +3235,10 @@ PROXY_DECLARE(int) ap_proxy_connect_backend(const char *proxy_function,
                 loglevel = APLOG_ERR;
                 ap_log_error(APLOG_MARK, loglevel, rv, s, APLOGNO(02453)
                              "%s: error creating Unix domain socket for "
-                             "target %s",
+                             "target %s:%d",
                              proxy_function,
-                             worker->s->hostname_ex);
+                             worker->s->hostname_ex,
+                             (int)worker->s->port);
                 break;
             }
             conn->connection = NULL;
@@ -3161,19 +3248,21 @@ PROXY_DECLARE(int) ap_proxy_connect_backend(const char *proxy_function,
                 apr_socket_close(newsock);
                 ap_log_error(APLOG_MARK, APLOG_ERR, rv, s, APLOGNO(02454)
                              "%s: attempt to connect to Unix domain socket "
-                             "%s (%s) failed",
+                             "%s (%s:%d) failed",
                              proxy_function,
                              conn->uds_path,
-                             worker->s->hostname_ex);
+                             worker->s->hostname_ex,
+                             (int)worker->s->port);
                 break;
             }
 
             ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, APLOGNO(02823)
                          "%s: connection established with Unix domain socket "
-                         "%s (%s)",
+                         "%s (%s:%d)",
                          proxy_function,
                          conn->uds_path,
-                         worker->s->hostname_ex);
+                         worker->s->hostname_ex,
+                         (int)worker->s->port);
         }
         else
 #endif
@@ -3184,10 +3273,11 @@ PROXY_DECLARE(int) ap_proxy_connect_backend(const char *proxy_function,
                 loglevel = backend_addr->next ? APLOG_DEBUG : APLOG_ERR;
                 ap_log_error(APLOG_MARK, loglevel, rv, s, APLOGNO(00952)
                              "%s: error creating fam %d socket for "
-                             "target %s",
+                             "target %s:%d",
                              proxy_function,
                              backend_addr->family,
-                             worker->s->hostname_ex);
+                             worker->s->hostname_ex,
+                             (int)worker->s->port);
                 /*
                  * this could be an IPv6 address from the DNS but the
                  * local machine won't give us an IPv6 socket; hopefully the
@@ -3236,8 +3326,9 @@ PROXY_DECLARE(int) ap_proxy_connect_backend(const char *proxy_function,
                 }
             }
             ap_log_error(APLOG_MARK, APLOG_TRACE2, 0, s,
-                         "%s: fam %d socket created to connect to %s",
-                         proxy_function, backend_addr->family, worker->s->hostname_ex);
+                         "%s: fam %d socket created to connect to %s:%d",
+                         proxy_function, backend_addr->family,
+                         worker->s->hostname_ex, (int)worker->s->port);
 
             if (conf->source_address_set) {
                 local_addr = apr_pmemdup(conn->scpool, conf->source_address,
@@ -3259,19 +3350,38 @@ PROXY_DECLARE(int) ap_proxy_connect_backend(const char *proxy_function,
                 apr_socket_close(newsock);
                 loglevel = backend_addr->next ? APLOG_DEBUG : APLOG_ERR;
                 ap_log_error(APLOG_MARK, loglevel, rv, s, APLOGNO(00957)
-                             "%s: attempt to connect to %pI (%s) failed",
+                             "%s: attempt to connect to %pI (%s:%d) failed",
                              proxy_function,
                              backend_addr,
-                             worker->s->hostname_ex);
+                             worker->s->hostname_ex,
+                             (int)worker->s->port);
                 backend_addr = backend_addr->next;
+                /*
+                 * If we run out of resolved IP's when connecting and if
+                 * we cache the resolution in the worker the resolution
+                 * might have changed. Hence try a DNS lookup to see if this
+                 * helps.
+                 */
+                if (!backend_addr && !did_dns_lookup && worker->cp->addr) {
+                    /*
+                     * In case of an error backend_addr will be NULL which
+                     * is enough to leave the loop.
+                     */
+                    apr_sockaddr_info_get(&backend_addr,
+                                          conn->hostname, APR_UNSPEC,
+                                          conn->port, 0,
+                                          conn->pool);
+                    did_dns_lookup = 1;
+                }
                 continue;
             }
 
             ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, APLOGNO(02824)
-                         "%s: connection established with %pI (%s)",
+                         "%s: connection established with %pI (%s:%d)",
                          proxy_function,
                          backend_addr,
-                         worker->s->hostname_ex);
+                         worker->s->hostname_ex,
+                         (int)worker->s->port);
         }
 
         /* Set a timeout on the socket */
@@ -3302,10 +3412,11 @@ PROXY_DECLARE(int) ap_proxy_connect_backend(const char *proxy_function,
                     loglevel = backend_addr->next ? APLOG_DEBUG : APLOG_ERR;
                     ap_log_error(APLOG_MARK, loglevel, rv, s, APLOGNO(00958)
                                  "%s: attempt to connect to %s:%d "
-                                 "via http CONNECT through %pI (%s) failed",
+                                 "via http CONNECT through %pI (%s:%d) failed",
                                  proxy_function,
                                  forward->target_host, forward->target_port,
-                                 backend_addr, worker->s->hostname_ex);
+                                 backend_addr, worker->s->hostname_ex,
+                                 (int)worker->s->port);
                     backend_addr = backend_addr->next;
                     continue;
                 }
@@ -3325,9 +3436,10 @@ PROXY_DECLARE(int) ap_proxy_connect_backend(const char *proxy_function,
                 worker->s->error_time = apr_time_now();
                 worker->s->status |= PROXY_WORKER_IN_ERROR;
                 ap_log_error(APLOG_MARK, APLOG_ERR, 0, s, APLOGNO(00959)
-                    "ap_proxy_connect_backend disabling worker for (%s) for %"
+                    "ap_proxy_connect_backend disabling worker for (%s:%d) for %"
                     APR_TIME_T_FMT "s",
-                    worker->s->hostname_ex, apr_time_sec(worker->s->retry));
+                    worker->s->hostname_ex, (int)worker->s->port,
+                    apr_time_sec(worker->s->retry));
             }
         }
         else {
@@ -3352,6 +3464,19 @@ PROXY_DECLARE(int) ap_proxy_connect_backend(const char *proxy_function,
             socket_cleanup(conn);
         }
         rv = APR_EINVAL;
+    }
+
+    if ((rv == APR_SUCCESS) && did_dns_lookup) {
+        /*
+         * A local DNS lookup caused a successful connect. Trigger to update
+         * the worker cache next time.
+         * We don't care handling any locking errors. If something fails we
+         * just continue with the existing cache value.
+         */
+        if (PROXY_THREAD_LOCK(worker) == APR_SUCCESS) {
+            worker->cp->addr = NULL;
+            PROXY_THREAD_UNLOCK(worker);
+        }
     }
 
     return rv == APR_SUCCESS ? OK : DECLINED;
@@ -3874,16 +3999,15 @@ PROXY_DECLARE(int) ap_proxy_create_hdrbrgd(apr_pool_t *p,
                                             char **old_cl_val,
                                             char **old_te_val)
 {
+    int rc = OK;
     conn_rec *c = r->connection;
-    int counter;
     char *buf;
-    const apr_array_header_t *headers_in_array;
-    const apr_table_entry_t *headers_in;
-    apr_table_t *saved_headers_in;
+    apr_table_t *saved_headers_in = r->headers_in;
+    const char *saved_host = apr_table_get(saved_headers_in, "Host");
     apr_bucket *e;
-    int do_100_continue;
+    int force10 = 0, do_100_continue = 0;
     conn_rec *origin = p_conn->connection;
-    const char *fpr1, *creds;
+    const char *host, *creds, *val;
     proxy_dir_conf *dconf = ap_get_module_config(r->per_dir_config, &proxy_module);
 
     /*
@@ -3891,82 +4015,112 @@ PROXY_DECLARE(int) ap_proxy_create_hdrbrgd(apr_pool_t *p,
      * To be compliant, we only use 100-Continue for requests with bodies.
      * We also make sure we won't be talking HTTP/1.0 as well.
      */
-    fpr1 = apr_table_get(r->subprocess_env, "force-proxy-request-1.0");
-    do_100_continue = PROXY_DO_100_CONTINUE(worker, r);
-
-    if (fpr1) {
-        /*
-         * According to RFC 2616 8.2.3 we are not allowed to forward an
-         * Expect: 100-continue to an HTTP/1.0 server. Instead we MUST return
-         * a HTTP_EXPECTATION_FAILED
-         */
-        if (r->expecting_100) {
-            return HTTP_EXPECTATION_FAILED;
-        }
-        buf = apr_pstrcat(p, r->method, " ", url, " HTTP/1.0" CRLF, NULL);
-        p_conn->close = 1;
-    } else {
-        buf = apr_pstrcat(p, r->method, " ", url, " HTTP/1.1" CRLF, NULL);
+    if (apr_table_get(r->subprocess_env, "force-proxy-request-1.0")) {
+        force10 = 1;
     }
-    if (apr_table_get(r->subprocess_env, "proxy-nokeepalive")) {
+    else if (apr_table_get(r->notes, "proxy-100-continue")
+             || PROXY_SHOULD_PING_100_CONTINUE(worker, r)) {
+        do_100_continue = 1;
+    }
+    if (force10 || apr_table_get(r->subprocess_env, "proxy-nokeepalive")) {
         if (origin) {
             origin->keepalive = AP_CONN_CLOSE;
         }
         p_conn->close = 1;
     }
-    ap_xlate_proto_to_ascii(buf, strlen(buf));
-    e = apr_bucket_pool_create(buf, strlen(buf), p, c->bucket_alloc);
-    APR_BRIGADE_INSERT_TAIL(header_brigade, e);
-    if (dconf->preserve_host == 0) {
-        if (ap_strchr_c(uri->hostname, ':')) { /* if literal IPv6 address */
-            if (uri->port_str && uri->port != DEFAULT_HTTP_PORT) {
-                buf = apr_pstrcat(p, "Host: [", uri->hostname, "]:",
-                                  uri->port_str, CRLF, NULL);
-            } else {
-                buf = apr_pstrcat(p, "Host: [", uri->hostname, "]", CRLF, NULL);
-            }
-        } else {
-            if (uri->port_str && uri->port != DEFAULT_HTTP_PORT) {
-                buf = apr_pstrcat(p, "Host: ", uri->hostname, ":",
-                                  uri->port_str, CRLF, NULL);
-            } else {
-                buf = apr_pstrcat(p, "Host: ", uri->hostname, CRLF, NULL);
-            }
-        }
+
+    if (force10) {
+        buf = apr_pstrcat(p, r->method, " ", url, " HTTP/1.0" CRLF, NULL);
     }
     else {
-        /* don't want to use r->hostname, as the incoming header might have a
-         * port attached
-         */
-        const char* hostname = apr_table_get(r->headers_in,"Host");
-        if (!hostname) {
-            hostname =  r->server->server_hostname;
-            ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, r, APLOGNO(01092)
-                          "no HTTP 0.9 request (with no host line) "
-                          "on incoming request and preserve host set "
-                          "forcing hostname to be %s for uri %s",
-                          hostname, r->uri);
-        }
-        buf = apr_pstrcat(p, "Host: ", hostname, CRLF, NULL);
+        buf = apr_pstrcat(p, r->method, " ", url, " HTTP/1.1" CRLF, NULL);
     }
     ap_xlate_proto_to_ascii(buf, strlen(buf));
     e = apr_bucket_pool_create(buf, strlen(buf), p, c->bucket_alloc);
     APR_BRIGADE_INSERT_TAIL(header_brigade, e);
 
     /*
-     * Save the original headers in here and restore them when leaving, since
-     * we will apply proxy purpose only modifications (eg. clearing hop-by-hop
-     * headers, add Via or X-Forwarded-* or Expect...), whereas the originals
-     * will be needed later to prepare the correct response and logging.
+     * Make a copy on r->headers_in for the request we make to the backend,
+     * modify the copy in place according to our configuration and connection
+     * handling, use it to fill in the forwarded headers' brigade, and finally
+     * restore the saved/original ones in r->headers_in.
      *
      * Note: We need to take r->pool for apr_table_copy as the key / value
      * pairs in r->headers_in have been created out of r->pool and
      * p might be (and actually is) a longer living pool.
      * This would trigger the bad pool ancestry abort in apr_table_copy if
      * apr is compiled with APR_POOL_DEBUG.
+     *
+     * icing: if p indeed lives longer than r->pool, we should allocate
+     * all new header values from r->pool as well and avoid leakage.
      */
-    saved_headers_in = r->headers_in;
     r->headers_in = apr_table_copy(r->pool, saved_headers_in);
+
+    /* Return the original Transfer-Encoding and/or Content-Length values
+     * then drop the headers, they must be set by the proxy handler based
+     * on the actual body being forwarded.
+     */
+    if ((*old_te_val = (char *)apr_table_get(r->headers_in,
+                                             "Transfer-Encoding"))) {
+        apr_table_unset(r->headers_in, "Transfer-Encoding");
+    }
+    if ((*old_cl_val = (char *)apr_table_get(r->headers_in,
+                                             "Content-Length"))) {
+        apr_table_unset(r->headers_in, "Content-Length");
+    }
+
+    /* Clear out hop-by-hop request headers not to forward */
+    if (ap_proxy_clear_connection(r, r->headers_in) < 0) {
+        rc = HTTP_BAD_REQUEST;
+        goto cleanup;
+    }
+
+    /* RFC2616 13.5.1 says we should strip these */
+    apr_table_unset(r->headers_in, "Keep-Alive");
+    apr_table_unset(r->headers_in, "Upgrade");
+    apr_table_unset(r->headers_in, "TE");
+
+    /* FIXME: since we now handle r->trailers_in on forwarding
+     * request bodies, it seems unwise to clear any Trailer
+     * header present. Is this the correct thing now?
+     */
+    if (force10)
+        apr_table_unset(r->headers_in, "Trailer");
+
+    /* Compute Host header */
+    if (dconf->preserve_host == 0) {
+        if (ap_strchr_c(uri->hostname, ':')) { /* if literal IPv6 address */
+            if (uri->port_str && uri->port != DEFAULT_HTTP_PORT) {
+                host = apr_pstrcat(r->pool, "[", uri->hostname, "]:",
+                                   uri->port_str, NULL);
+            } else {
+                host = apr_pstrcat(r->pool, "[", uri->hostname, "]", NULL);
+            }
+        } else {
+            if (uri->port_str && uri->port != DEFAULT_HTTP_PORT) {
+                host = apr_pstrcat(r->pool, uri->hostname, ":",
+                                   uri->port_str, NULL);
+            } else {
+                host = uri->hostname;
+            }
+        }
+        apr_table_setn(r->headers_in, "Host", host);
+    }
+    else {
+        /* don't want to use r->hostname as the incoming header might have a
+         * port attached, let's use the original header.
+         */
+        host = saved_host;
+        if (!host) {
+            host =  r->server->server_hostname;
+            ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, r, APLOGNO(01092)
+                          "no HTTP 0.9 request (with no host line) "
+                          "on incoming request and preserve host set "
+                          "forcing hostname to be %s for uri %s",
+                          host, r->uri);
+            apr_table_setn(r->headers_in, "Host", host);
+        }
+    }
 
     /* handle Via */
     if (conf->viaopt == via_block) {
@@ -3985,12 +4139,12 @@ PROXY_DECLARE(int) ap_proxy_create_hdrbrgd(apr_pool_t *p,
         /* Generate outgoing Via: header with/without server comment: */
         apr_table_mergen(r->headers_in, "Via",
                          (conf->viaopt == via_full)
-                         ? apr_psprintf(p, "%d.%d %s%s (%s)",
+                         ? apr_psprintf(r->pool, "%d.%d %s%s (%s)",
                                         HTTP_VERSION_MAJOR(r->proto_num),
                                         HTTP_VERSION_MINOR(r->proto_num),
                                         server_name, server_portstr,
                                         AP_SERVER_BASEVERSION)
-                         : apr_psprintf(p, "%d.%d %s%s",
+                         : apr_psprintf(r->pool, "%d.%d %s%s",
                                         HTTP_VERSION_MAJOR(r->proto_num),
                                         HTTP_VERSION_MINOR(r->proto_num),
                                         server_name, server_portstr)
@@ -4001,14 +4155,18 @@ PROXY_DECLARE(int) ap_proxy_create_hdrbrgd(apr_pool_t *p,
      * to backend
      */
     if (do_100_continue) {
-        const char *val;
-
         /* Add the Expect header if not already there. */
-        if (((val = apr_table_get(r->headers_in, "Expect")) == NULL)
-                || (ap_cstr_casecmp(val, "100-Continue") != 0 /* fast path */
-                    && !ap_find_token(r->pool, val, "100-Continue"))) {
+        if (!(val = apr_table_get(r->headers_in, "Expect"))
+            || (ap_cstr_casecmp(val, "100-Continue") != 0 /* fast path */
+                && !ap_find_token(r->pool, val, "100-Continue"))) {
             apr_table_mergen(r->headers_in, "Expect", "100-Continue");
         }
+    }
+    else {
+        /* XXX: we should strip the 100-continue token only from the
+         * Expect header, but are there others actually used anywhere?
+         */
+        apr_table_unset(r->headers_in, "Expect");
     }
 
     /* X-Forwarded-*: handling
@@ -4033,8 +4191,6 @@ PROXY_DECLARE(int) ap_proxy_create_hdrbrgd(apr_pool_t *p,
      */
     if (dconf->add_forwarded_headers) {
         if (PROXYREQ_REVERSE == r->proxyreq) {
-            const char *buf;
-
             /* Add X-Forwarded-For: so that the upstream has a chance to
              * determine, where the original request came from.
              */
@@ -4044,8 +4200,9 @@ PROXY_DECLARE(int) ap_proxy_create_hdrbrgd(apr_pool_t *p,
             /* Add X-Forwarded-Host: so that upstream knows what the
              * original request hostname was.
              */
-            if ((buf = apr_table_get(r->headers_in, "Host"))) {
-                apr_table_mergen(r->headers_in, "X-Forwarded-Host", buf);
+            if (saved_host) {
+                apr_table_mergen(r->headers_in, "X-Forwarded-Host",
+                                 saved_host);
             }
 
             /* Add X-Forwarded-Server: so that upstream knows what the
@@ -4057,85 +4214,52 @@ PROXY_DECLARE(int) ap_proxy_create_hdrbrgd(apr_pool_t *p,
         }
     }
 
-    proxy_run_fixups(r);
-    if (ap_proxy_clear_connection(r, r->headers_in) < 0) {
-        return HTTP_BAD_REQUEST;
+    /* Do we want to strip Proxy-Authorization ?
+     * If we haven't used it, then NO
+     * If we have used it then MAYBE: RFC2616 says we MAY propagate it.
+     * So let's make it configurable by env.
+     */
+    if (r->user != NULL /* we've authenticated */
+        && !apr_table_get(r->subprocess_env, "Proxy-Chain-Auth")) {
+        apr_table_unset(r->headers_in, "Proxy-Authorization");
     }
 
+    /* for sub-requests, ignore freshness/expiry headers */
+    if (r->main) {
+        apr_table_unset(r->headers_in, "If-Match");
+        apr_table_unset(r->headers_in, "If-Modified-Since");
+        apr_table_unset(r->headers_in, "If-Range");
+        apr_table_unset(r->headers_in, "If-Unmodified-Since");
+        apr_table_unset(r->headers_in, "If-None-Match");
+    }
+
+    /* Add credentials (per worker) if any */
     creds = apr_table_get(r->notes, "proxy-basic-creds");
     if (creds) {
         apr_table_mergen(r->headers_in, "Proxy-Authorization", creds);
     }
 
-    /* send request headers */
-    headers_in_array = apr_table_elts(r->headers_in);
-    headers_in = (const apr_table_entry_t *) headers_in_array->elts;
-    for (counter = 0; counter < headers_in_array->nelts; counter++) {
-        if (headers_in[counter].key == NULL
-            || headers_in[counter].val == NULL
+    /* run hook to fixup the request we are about to send */
+    proxy_run_fixups(r);
 
-            /* Already sent */
-            || !ap_cstr_casecmp(headers_in[counter].key, "Host")
-
-            /* Clear out hop-by-hop request headers not to send
-             * RFC2616 13.5.1 says we should strip these headers
-             */
-            || !ap_cstr_casecmp(headers_in[counter].key, "Keep-Alive")
-            || !ap_cstr_casecmp(headers_in[counter].key, "TE")
-            || !ap_cstr_casecmp(headers_in[counter].key, "Trailer")
-            || !ap_cstr_casecmp(headers_in[counter].key, "Upgrade")
-
-            ) {
-            continue;
-        }
-        /* Do we want to strip Proxy-Authorization ?
-         * If we haven't used it, then NO
-         * If we have used it then MAYBE: RFC2616 says we MAY propagate it.
-         * So let's make it configurable by env.
-         */
-        if (!ap_cstr_casecmp(headers_in[counter].key,"Proxy-Authorization")) {
-            if (r->user != NULL) { /* we've authenticated */
-                if (!apr_table_get(r->subprocess_env, "Proxy-Chain-Auth")) {
-                    continue;
-                }
-            }
-        }
-
-        /* Skip Transfer-Encoding and Content-Length for now.
-         */
-        if (!ap_cstr_casecmp(headers_in[counter].key, "Transfer-Encoding")) {
-            *old_te_val = headers_in[counter].val;
-            continue;
-        }
-        if (!ap_cstr_casecmp(headers_in[counter].key, "Content-Length")) {
-            *old_cl_val = headers_in[counter].val;
-            continue;
-        }
-
-        /* for sub-requests, ignore freshness/expiry headers */
-        if (r->main) {
-            if (   !ap_cstr_casecmp(headers_in[counter].key, "If-Match")
-                || !ap_cstr_casecmp(headers_in[counter].key, "If-Modified-Since")
-                || !ap_cstr_casecmp(headers_in[counter].key, "If-Range")
-                || !ap_cstr_casecmp(headers_in[counter].key, "If-Unmodified-Since")
-                || !ap_cstr_casecmp(headers_in[counter].key, "If-None-Match")) {
-                continue;
-            }
-        }
-
-        buf = apr_pstrcat(p, headers_in[counter].key, ": ",
-                          headers_in[counter].val, CRLF,
-                          NULL);
-        ap_xlate_proto_to_ascii(buf, strlen(buf));
-        e = apr_bucket_pool_create(buf, strlen(buf), p, c->bucket_alloc);
-        APR_BRIGADE_INSERT_TAIL(header_brigade, e);
-    }
-
-    /* Restore the original headers in (see comment above),
-     * we won't modify them anymore.
+    /* We used to send `Host: ` always first, so let's keep it that
+     * way. No telling which legacy backend is relying on this.
+     * If proxy_run_fixups() changed the value, use it (though removal
+     * is ignored).
      */
+    val = apr_table_get(r->headers_in, "Host");
+    if (val) {
+        apr_table_unset(r->headers_in, "Host");
+        host = val;
+    }
+    ap_h1_append_header(header_brigade, r->pool, "Host", host);
+
+    /* Append the (remaining) headers to the brigade */
+    ap_h1_append_headers(header_brigade, r, r->headers_in);
+
+cleanup:
     r->headers_in = saved_headers_in;
-    return OK;
+    return rc;
 }
 
 PROXY_DECLARE(int) ap_proxy_prefetch_input(request_rec *r,
@@ -4280,12 +4404,9 @@ PROXY_DECLARE(int) ap_proxy_spool_input(request_rec *r,
     apr_bucket *e;
     apr_off_t bytes, fsize = 0;
     apr_file_t *tmpfile = NULL;
-    apr_off_t limit;
 
     *bytes_spooled = 0;
     body_brigade = apr_brigade_create(p, bucket_alloc);
-
-    limit = ap_get_limit_req_body(r);
 
     do {
         if (APR_BRIGADE_EMPTY(input_brigade)) {
@@ -4304,17 +4425,6 @@ PROXY_DECLARE(int) ap_proxy_spool_input(request_rec *r,
         apr_brigade_length(input_brigade, 1, &bytes);
 
         if (*bytes_spooled + bytes > max_mem_spool) {
-            /*
-             * LimitRequestBody does not affect Proxy requests (Should it?).
-             * Let it take effect if we decide to store the body in a
-             * temporary file on disk.
-             */
-            if (limit && (*bytes_spooled + bytes > limit)) {
-                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01088)
-                              "Request body is larger than the configured "
-                              "limit of %" APR_OFF_T_FMT, limit);
-                return HTTP_REQUEST_ENTITY_TOO_LARGE;
-            }
             /* can't spool any more in memory; write latest brigade to disk */
             if (tmpfile == NULL) {
                 const char *temp_dir;
@@ -4801,10 +4911,10 @@ PROXY_DECLARE(apr_status_t) ap_proxy_tunnel_create(proxy_tunnel_rec **ptunnel,
     tunnel->origin->pfd->desc.s = ap_get_conn_socket(c_o);
     tunnel->origin->pfd->client_data = tunnel->origin;
 
-    /* Defaults to the smallest timeout of both connections */
+    /* Defaults to the biggest timeout of both connections */
     apr_socket_timeout_get(tunnel->client->pfd->desc.s, &timeout);
     apr_socket_timeout_get(tunnel->origin->pfd->desc.s, &tunnel->timeout);
-    if (timeout >= 0 && (tunnel->timeout < 0 || tunnel->timeout > timeout)) {
+    if (timeout >= 0 && (tunnel->timeout < 0 || tunnel->timeout < timeout)) {
         tunnel->timeout = timeout;
     }
 

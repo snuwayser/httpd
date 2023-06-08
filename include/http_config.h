@@ -313,12 +313,9 @@ struct cmd_parms_struct {
     apr_pool_t *temp_pool;
     /** Server_rec being configured for */
     server_rec *server;
-    /** If configuring for a directory, pathname of that directory.
-     *  NOPE!  That's what it meant previous to the existence of &lt;Files&gt;,
-     * &lt;Location&gt; and regex matching.  Now the only usefulness that can be
-     * derived from this field is whether a command is being called in a
-     * server context (path == NULL) or being called in a dir context
-     * (path != NULL).  */
+    /** If configuring for a directory, pathname of that directory. If the
+     *  pathname is a regex, regex will be non-NULL below. If path is NULL,
+     *  the directive is being called from a server context. */
     char *path;
     /** configuration command */
     const command_rec *cmd;
@@ -331,6 +328,9 @@ struct cmd_parms_struct {
     /** If the current directive is EXEC_ON_READ, this is the last 
         (non-EXEC_ON_READ)  enclosing directive  */
     ap_directive_t *parent;
+
+    /** If the path is a regex, compiled regex will be not NULL. */
+    ap_regex_t *regex;
 };
 
 /**
@@ -1350,6 +1350,16 @@ AP_DECLARE_HOOK(void,test_config,(apr_pool_t *pconf, server_rec *s))
 
 /**
  * Run the post_config function for each module
+ *
+ * The function might be called multiple times.  @a pconf, @a plog, and
+ * @a ptemp may be cleared and/or destroyed between calls.
+ *
+ * The function will be called zero or one times with the server's state being
+ * #AP_SQ_MS_CREATE_PRE_CONFIG, and will be called one or more times with
+ * the server's state being #AP_SQ_MS_CREATE_CONFIG.
+ *
+ * @see ap_state_query(), #AP_SQ_MAIN_STATE
+ *
  * @param pconf The config pool
  * @param plog The logging streams pool
  * @param ptemp The temporary pool

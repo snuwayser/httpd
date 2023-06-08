@@ -25,6 +25,7 @@
 #include "apr_fnmatch.h"
 #include "apr_hash.h"
 #include "apr_thread_proc.h"    /* for RLIMIT stuff */
+#include "apr_version.h"
 
 #define APR_WANT_IOVEC
 #define APR_WANT_STRFUNC
@@ -493,6 +494,23 @@ static void delete_meta_bucket(apr_bucket *bucket)
     apr_bucket_delete(bucket);
 }
 
+#if defined(WIN32) && (APR_MAJOR_VERSION == 1 && APR_MINOR_VERSION <= 7)
+#undef APR_TCP_NOPUSH_FLAG
+#define APR_TCP_NOPUSH_FLAG 0
+#endif
+
+static APR_INLINE void sock_nopush(apr_socket_t *s, int to)
+{
+    /* Disable TCP_NOPUSH handling on OSX since unsetting it won't push
+     * retained data, which might introduce delays if further data don't
+     * come soon enough or cause the last chunk to be sent only when the
+     * connection is shutdown (e.g. after KeepAliveTimeout).
+     */
+#if APR_TCP_NOPUSH_FLAG && !defined(__APPLE__)
+    (void)apr_socket_opt_set(s, APR_TCP_NOPUSH, to);
+#endif
+}
+
 static apr_status_t send_brigade_nonblocking(apr_socket_t *s,
                                              apr_bucket_brigade *bb,
                                              core_output_ctx_t *ctx,
@@ -514,7 +532,7 @@ static apr_status_t send_brigade_nonblocking(apr_socket_t *s,
 #if APR_HAS_SENDFILE
         if (can_sendfile_bucket(bucket)) {
             if (nvec > 0) {
-                (void)apr_socket_opt_set(s, APR_TCP_NOPUSH, 1);
+                sock_nopush(s, 1);
                 rv = writev_nonblocking(s, bb, ctx, nbytes, nvec, c);
                 if (rv != APR_SUCCESS) {
                     goto cleanup;
@@ -544,7 +562,7 @@ static apr_status_t send_brigade_nonblocking(apr_socket_t *s,
                     nbytes = 0;
                     nvec = 0;
                 }
-                (void)apr_socket_opt_set(s, APR_TCP_NOPUSH, 0);
+                sock_nopush(s, 0);
 
                 rv = apr_bucket_read(bucket, &data, &length, APR_BLOCK_READ);
             }
@@ -566,41 +584,41 @@ static apr_status_t send_brigade_nonblocking(apr_socket_t *s,
             if (!nvec) {
                 delete_meta_bucket(bucket);
             }
-            continue;
         }
-
-        /* Make sure that these new data fit in our iovec. */
-        if (nvec == ctx->nvec) {
-            if (nvec == NVEC_MAX) {
-                (void)apr_socket_opt_set(s, APR_TCP_NOPUSH, 1);
-                rv = writev_nonblocking(s, bb, ctx, nbytes, nvec, c);
-                if (rv != APR_SUCCESS) {
-                    goto cleanup;
+        else {
+            /* Make sure that these new data fit in our iovec. */
+            if (nvec == ctx->nvec) {
+                if (nvec == NVEC_MAX) {
+                    sock_nopush(s, 1);
+                    rv = writev_nonblocking(s, bb, ctx, nbytes, nvec, c);
+                    if (rv != APR_SUCCESS) {
+                        goto cleanup;
+                    }
+                    nbytes = 0;
+                    nvec = 0;
                 }
-                nbytes = 0;
-                nvec = 0;
+                else {
+                    struct iovec *newvec;
+                    apr_size_t newn = nvec * 2;
+                    if (newn < NVEC_MIN) {
+                        newn = NVEC_MIN;
+                    }
+                    else if (newn > NVEC_MAX) {
+                        newn = NVEC_MAX;
+                    }
+                    newvec = apr_palloc(c->pool, newn * sizeof(struct iovec));
+                    if (nvec) {
+                        memcpy(newvec, ctx->vec, nvec * sizeof(struct iovec));
+                    }
+                    ctx->vec = newvec;
+                    ctx->nvec = newn;
+                }
             }
-            else {
-                struct iovec *newvec;
-                apr_size_t newn = nvec * 2;
-                if (newn < NVEC_MIN) {
-                    newn = NVEC_MIN;
-                }
-                else if (newn > NVEC_MAX) {
-                    newn = NVEC_MAX;
-                }
-                newvec = apr_palloc(c->pool, newn * sizeof(struct iovec));
-                if (nvec) {
-                    memcpy(newvec, ctx->vec, nvec * sizeof(struct iovec));
-                }
-                ctx->vec = newvec;
-                ctx->nvec = newn;
-            }
+            nbytes += length;
+            ctx->vec[nvec].iov_base = (void *)data;
+            ctx->vec[nvec].iov_len = length;
+            nvec++;
         }
-        nbytes += length;
-        ctx->vec[nvec].iov_base = (void *)data;
-        ctx->vec[nvec].iov_len = length;
-        nvec++;
 
         /* Flush above max threshold, unless the brigade still contains in
          * memory buckets which we want to try writing in the same pass (if
@@ -610,7 +628,7 @@ static apr_status_t send_brigade_nonblocking(apr_socket_t *s,
         if (nbytes > sconf->flush_max_threshold
                 && next != APR_BRIGADE_SENTINEL(bb)
                 && next->length && !is_in_memory_bucket(next)) {
-            (void)apr_socket_opt_set(s, APR_TCP_NOPUSH, 1);
+            sock_nopush(s, 1);
             rv = writev_nonblocking(s, bb, ctx, nbytes, nvec, c);
             if (rv != APR_SUCCESS) {
                 goto cleanup;
@@ -624,7 +642,7 @@ static apr_status_t send_brigade_nonblocking(apr_socket_t *s,
     }
 
 cleanup:
-    (void)apr_socket_opt_set(s, APR_TCP_NOPUSH, 0);
+    sock_nopush(s, 0);
     return rv;
 }
 

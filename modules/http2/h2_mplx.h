@@ -44,18 +44,29 @@ struct h2_iqueue;
 
 #include <apr_queue.h>
 
+#include "h2_workers.h"
+
+typedef struct h2_c2_transit h2_c2_transit;
+
+struct h2_c2_transit {
+    apr_pool_t *pool;
+    apr_bucket_alloc_t *bucket_alloc;
+};
+
 typedef struct h2_mplx h2_mplx;
 
 struct h2_mplx {
-    long id;
+    int child_num;                  /* child this runs in */
+    apr_uint32_t id;                /* id unique per child */
     conn_rec *c1;                   /* the main connection */
     apr_pool_t *pool;
     struct h2_stream *stream0;      /* HTTP/2's stream 0 */
     server_rec *s;                  /* server for master conn */
 
-    int aborted;
+    int shutdown;                   /* we are shutting down */
+    int aborted;                    /* we need to get out of here asap */
     int polling;                    /* is waiting/processing pollset events */
-    int is_registered;              /* is registered at h2_workers */
+    ap_conn_producer_t *producer;   /* registered producer at h2_workers */
 
     struct h2_ihash_t *streams;     /* all streams active */
     struct h2_ihash_t *shold;       /* all streams done with c2 processing ongoing */
@@ -64,33 +75,34 @@ struct h2_mplx {
     struct h2_iqueue *q;            /* all stream ids that need to be started */
 
     apr_size_t stream_max_mem;      /* max memory to buffer for a stream */
-    int max_streams;                /* max # of concurrent streams */
-    int max_stream_id_started;      /* highest stream id that started processing */
+    apr_uint32_t max_streams;       /* max # of concurrent streams */
+    apr_uint32_t max_stream_id_started; /* highest stream id that started processing */
 
-    int processing_count;           /* # of c2 working for this mplx */
-    int processing_limit;           /* current limit on processing c2s, dynamic */
-    int processing_max;             /* max, hard limit of processing c2s */
+    apr_uint32_t processing_count;  /* # of c2 working for this mplx */
+    apr_uint32_t processing_limit;  /* current limit on processing c2s, dynamic */
+    apr_uint32_t processing_max;    /* max, hard limit of processing c2s */
     
     apr_time_t last_mood_change;    /* last time, processing limit changed */
     apr_interval_time_t mood_update_interval; /* how frequent we update at most */
-    int irritations_since; /* irritations (>0) or happy events (<0) since last mood change */
+    apr_uint32_t irritations_since; /* irritations (>0) or happy events (<0) since last mood change */
 
     apr_thread_mutex_t *lock;
     struct apr_thread_cond_t *join_wait;
     
     apr_pollset_t *pollset;         /* pollset for c1/c2 IO events */
-    apr_array_header_t *streams_to_poll; /* streams to add to the pollset */
     apr_array_header_t *streams_ev_in;
     apr_array_header_t *streams_ev_out;
 
-#if !H2_POLL_STREAMS
-    apr_thread_mutex_t *poll_lock; /* not the painter */
+    apr_thread_mutex_t *poll_lock; /* protect modifications of queues below */
     struct h2_iqueue *streams_input_read;  /* streams whose input has been read from */
     struct h2_iqueue *streams_output_written; /* streams whose output has been written to */
-#endif
+
     struct h2_workers *workers;     /* h2 workers process wide instance */
 
     request_rec *scratch_r;         /* pseudo request_rec for scoreboard reporting */
+
+    apr_uint32_t max_spare_transits; /* max number of transit pools idling */
+    apr_array_header_t *c2_transits; /* base pools for running c2 connections */
 };
 
 apr_status_t h2_mplx_c1_child_init(apr_pool_t *pool, server_rec *s);
@@ -99,7 +111,9 @@ apr_status_t h2_mplx_c1_child_init(apr_pool_t *pool, server_rec *s);
  * Create the multiplexer for the given HTTP2 session. 
  * Implicitly has reference count 1.
  */
-h2_mplx *h2_mplx_c1_create(struct h2_stream *stream0, server_rec *s, apr_pool_t *master,
+h2_mplx *h2_mplx_c1_create(int child_id, apr_uint32_t id,
+                           struct h2_stream *stream0,
+                           server_rec *s, apr_pool_t *master,
                            struct h2_workers *workers);
 
 /**
@@ -125,7 +139,7 @@ int h2_mplx_c1_shutdown(h2_mplx *m);
  * @param pstream_count return the number of streams active
  */
 apr_status_t h2_mplx_c1_stream_cleanup(h2_mplx *m, struct h2_stream *stream,
-                                       int *pstream_count);
+                                       unsigned int *pstream_count);
 
 int h2_mplx_c1_stream_is_running(h2_mplx *m, struct h2_stream *stream);
 
@@ -138,17 +152,12 @@ int h2_mplx_c1_stream_is_running(h2_mplx *m, struct h2_stream *stream);
  * @param cmp the stream priority compare function
  * @param pstream_count on return the number of streams active in mplx
  */
-apr_status_t h2_mplx_c1_process(h2_mplx *m,
-                                struct h2_iqueue *read_to_process,
-                                h2_stream_get_fn *get_stream,
-                                h2_stream_pri_cmp_fn *cmp,
-                                struct h2_session *session,
-                                int *pstream_count);
-
-apr_status_t h2_mplx_c1_fwd_input(h2_mplx *m, struct h2_iqueue *input_pending,
-                                  h2_stream_get_fn *get_stream,
-                                  struct h2_session *session);
-
+void h2_mplx_c1_process(h2_mplx *m,
+                        struct h2_iqueue *read_to_process,
+                        h2_stream_get_fn *get_stream,
+                        h2_stream_pri_cmp_fn *cmp,
+                        struct h2_session *session,
+                        unsigned int *pstream_count);
 
 /**
  * Stream priorities have changed, reschedule pending requests.
@@ -160,7 +169,7 @@ apr_status_t h2_mplx_c1_fwd_input(h2_mplx *m, struct h2_iqueue *input_pending,
 apr_status_t h2_mplx_c1_reprioritize(h2_mplx *m, h2_stream_pri_cmp_fn *cmp,
                                     struct h2_session *session);
 
-typedef apr_status_t stream_ev_callback(void *ctx, struct h2_stream *stream);
+typedef void stream_ev_callback(void *ctx, struct h2_stream *stream);
 
 /**
  * Poll the primary connection for input and the active streams for output.
@@ -203,14 +212,15 @@ const struct h2_stream *h2_mplx_c2_stream_get(h2_mplx *m, int stream_id);
  */
 apr_status_t h2_mplx_worker_pop_c2(h2_mplx *m, conn_rec **out_c2);
 
+
 /**
- * A h2 worker reports a secondary connection processing done.
- * If it is will to do more work for this mplx (this c1 connection),
- * it provides `out_c`. Otherwise it passes NULL.
- * @param c2 the secondary connection finished processing
- * @param out_c2 NULL or a pointer where to reveive the next
- *               secondary connection to process.
+ * Session processing is entering KEEPALIVE, e.g. giving control
+ * to the MPM for monitoring incoming socket events only.
+ * Last chance for maintenance work before losing control.
  */
-void h2_mplx_worker_c2_done(conn_rec *c2, conn_rec **out_c2);
+void h2_mplx_c1_going_keepalive(h2_mplx *m);
+
+#define H2_MPLX_MSG(m, msg)     \
+    "h2_mplx(%d-%lu): "msg, m->child_num, (unsigned long)m->id
 
 #endif /* defined(__mod_h2__h2_mplx__) */

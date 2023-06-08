@@ -69,6 +69,7 @@
 #endif
 
 #include "ap_mpm.h"
+#include "mpm_common.h"         /* for ap_max_mem_free */
 
 /* A bunch of functions in util.c scan strings looking for certain characters.
  * To make that more efficient we encode a lookup table.  The test_char_table
@@ -186,7 +187,7 @@ AP_DECLARE(char *) ap_ht_time(apr_pool_t *p, apr_time_t t, const char *fmt,
  */
 AP_DECLARE(int) ap_strcmp_match(const char *str, const char *expected)
 {
-    int x, y;
+    apr_size_t x, y;
 
     for (x = 0, y = 0; expected[y]; ++y, ++x) {
         if (expected[y] == '*') {
@@ -210,7 +211,7 @@ AP_DECLARE(int) ap_strcmp_match(const char *str, const char *expected)
 
 AP_DECLARE(int) ap_strcasecmp_match(const char *str, const char *expected)
 {
-    int x, y;
+    apr_size_t x, y;
 
     for (x = 0, y = 0; expected[y]; ++y, ++x) {
         if (!str[x] && expected[y] != '*')
@@ -251,10 +252,8 @@ AP_DECLARE(int) ap_os_is_path_absolute(apr_pool_t *p, const char *dir)
 
 AP_DECLARE(int) ap_is_matchexp(const char *str)
 {
-    int x;
-
-    for (x = 0; str[x]; x++)
-        if ((str[x] == '*') || (str[x] == '?'))
+    for (; *str; str++)
+        if ((*str == '*') || (*str == '?'))
             return 1;
     return 0;
 }
@@ -2152,11 +2151,14 @@ AP_DECLARE(char *) ap_escape_urlencoded(apr_pool_t *p, const char *buffer)
 
 AP_DECLARE(char *) ap_escape_html2(apr_pool_t *p, const char *s, int toasc)
 {
-    int i, j;
+    apr_size_t i, j;
     char *x;
 
     /* first, count the number of extra characters */
-    for (i = 0, j = 0; s[i] != '\0'; i++)
+    for (i = 0, j = 0; s[i] != '\0'; i++) {
+        if (i + j > APR_SIZE_MAX - 6) {
+            abort();
+        }
         if (s[i] == '<' || s[i] == '>')
             j += 3;
         else if (s[i] == '&')
@@ -2165,6 +2167,7 @@ AP_DECLARE(char *) ap_escape_html2(apr_pool_t *p, const char *s, int toasc)
             j += 5;
         else if (toasc && !apr_isascii(s[i]))
             j += 5;
+    }
 
     if (j == 0)
         return apr_pstrmemdup(p, s, i);
@@ -2611,7 +2614,7 @@ AP_DECLARE(void) ap_content_type_tolower(char *str)
  */
 AP_DECLARE(char *) ap_escape_quotes(apr_pool_t *p, const char *instring)
 {
-    int newlen = 0;
+    apr_size_t size, extra = 0;
     const char *inchr = instring;
     char *outchr, *outstring;
 
@@ -2620,9 +2623,8 @@ AP_DECLARE(char *) ap_escape_quotes(apr_pool_t *p, const char *instring)
      * string up by an extra byte each time we find an unescaped ".
      */
     while (*inchr != '\0') {
-        newlen++;
         if (*inchr == '"') {
-            newlen++;
+            extra++;
         }
         /*
          * If we find a slosh, and it's not the last byte in the string,
@@ -2630,11 +2632,32 @@ AP_DECLARE(char *) ap_escape_quotes(apr_pool_t *p, const char *instring)
          */
         else if ((*inchr == '\\') && (inchr[1] != '\0')) {
             inchr++;
-            newlen++;
         }
         inchr++;
     }
-    outstring = apr_palloc(p, newlen + 1);
+
+    if (!extra) {
+        return apr_pstrdup(p, instring);
+    }
+
+    /* How large will the string become, once we escaped all the quotes?
+     * The tricky cases are
+     * - an `instring` that is already longer than `ptrdiff_t`
+     *   can hold (which is an undefined case in C, as C defines ptrdiff_t as
+     *   a signed difference between pointers into the same array and one index
+     *   beyond).
+     * - an `instring` that, including the `extra` chars we want to add, becomes
+     *   even larger than apr_size_t can handle.
+     * Since this function was not designed to ever return NULL for failure, we
+     * can only trigger a hard assertion failure. It seems more a programming
+     * mistake (or failure to verify the input causing this) that leads to this
+     * situation.
+     */
+    ap_assert(inchr - instring > 0);
+    size = ((apr_size_t)(inchr - instring)) + 1;
+    ap_assert(size + extra > size);
+
+    outstring = apr_palloc(p, size + extra);
     inchr = instring;
     outchr = outstring;
     /*
@@ -3221,7 +3244,7 @@ AP_DECLARE(apr_status_t) ap_varbuf_regsub(struct ap_varbuf *vb,
 static const char * const oom_message = "[crit] Memory allocation failed, "
                                         "aborting process." APR_EOL_STR;
 
-AP_DECLARE(void) ap_abort_on_oom()
+AP_DECLARE(void) ap_abort_on_oom(void)
 {
     int written, count = strlen(oom_message);
     const char *buf = oom_message;
@@ -3263,26 +3286,33 @@ AP_DECLARE(void *) ap_realloc(void *ptr, size_t size)
 
 #if APR_HAS_THREADS
 
-#if APR_VERSION_AT_LEAST(1,8,0) && !defined(AP_NO_THREAD_LOCAL)
-
-#define ap_thread_current_create apr_thread_current_create
-
-#else /* APR_VERSION_AT_LEAST(1,8,0) && !defined(AP_NO_THREAD_LOCAL) */
-
-#if AP_HAS_THREAD_LOCAL
+#if AP_HAS_THREAD_LOCAL && !APR_VERSION_AT_LEAST(1,8,0)
+static AP_THREAD_LOCAL apr_thread_t *current_thread = NULL;
+#endif
 
 struct thread_ctx {
     apr_thread_start_t func;
     void *data;
 };
 
-static AP_THREAD_LOCAL apr_thread_t *current_thread = NULL;
-
 static void *APR_THREAD_FUNC thread_start(apr_thread_t *thread, void *data)
 {
     struct thread_ctx *ctx = data;
 
+    /* Don't let the thread's pool allocator with no limits, though there
+     * is possibly no allocator with APR <= 1.7 and APR_POOL_DEBUG.
+     */
+    {
+        apr_pool_t *tp = apr_thread_pool_get(thread);
+        apr_allocator_t *ta = apr_pool_allocator_get(tp);
+        if (ta) {
+            apr_allocator_max_free_set(ta, ap_max_mem_free);
+        }
+    }
+
+#if AP_HAS_THREAD_LOCAL && !APR_VERSION_AT_LEAST(1,8,0)
     current_thread = thread;
+#endif
     return ctx->func(thread, ctx->data);
 }
 
@@ -3297,67 +3327,6 @@ AP_DECLARE(apr_status_t) ap_thread_create(apr_thread_t **thread,
     ctx->data = data;
     return apr_thread_create(thread, attr, thread_start, ctx, pool);
 }
-
-#endif /* AP_HAS_THREAD_LOCAL */
-
-AP_DECLARE(apr_status_t) ap_thread_current_create(apr_thread_t **current,
-                                                  apr_threadattr_t *attr,
-                                                  apr_pool_t *pool)
-{
-    apr_status_t rv;
-    apr_abortfunc_t abort_fn = apr_pool_abort_get(pool);
-    apr_allocator_t *allocator;
-    apr_os_thread_t osthd;
-    apr_pool_t *p;
-
-    *current = ap_thread_current();
-    if (*current) {
-        return APR_EEXIST;
-    }
-
-    rv = apr_allocator_create(&allocator);
-    if (rv != APR_SUCCESS) {
-        if (abort_fn)
-            abort_fn(rv);
-        return rv;
-    }
-    rv = apr_pool_create_unmanaged_ex(&p, abort_fn, allocator);
-    if (rv != APR_SUCCESS) {
-        apr_allocator_destroy(allocator);
-        return rv;
-    }
-    apr_allocator_owner_set(allocator, p);
-
-    osthd = apr_os_thread_current();
-    rv = apr_os_thread_put(current, &osthd, p);
-    if (rv != APR_SUCCESS) {
-        apr_pool_destroy(p);
-        return rv;
-    }
-
-#if AP_HAS_THREAD_LOCAL
-    current_thread = *current;
-#endif
-    return APR_SUCCESS;
-}
-
-AP_DECLARE(void) ap_thread_current_after_fork(void)
-{
-#if AP_HAS_THREAD_LOCAL
-    current_thread = NULL;
-#endif
-}
-
-AP_DECLARE(apr_thread_t *) ap_thread_current(void)
-{
-#if AP_HAS_THREAD_LOCAL
-    return current_thread;
-#else
-    return NULL;
-#endif
-}
-
-#endif /* APR_VERSION_AT_LEAST(1,8,0) && !defined(AP_NO_THREAD_LOCAL) */
 
 static apr_status_t main_thread_cleanup(void *arg)
 {
@@ -3378,6 +3347,9 @@ AP_DECLARE(apr_status_t) ap_thread_main_create(apr_thread_t **thread,
      */
     if ((rv = apr_threadattr_create(&attr, pool))
             || (rv = apr_threadattr_detach_set(attr, 1))
+#if APR_VERSION_AT_LEAST(1,8,0)
+            || (rv = apr_threadattr_max_free_set(attr, ap_max_mem_free))
+#endif
             || (rv = ap_thread_current_create(thread, attr, pool))) {
         *thread = NULL;
         return rv;
@@ -3387,6 +3359,71 @@ AP_DECLARE(apr_status_t) ap_thread_main_create(apr_thread_t **thread,
                               apr_pool_cleanup_null);
     return APR_SUCCESS;
 }
+
+#if !APR_VERSION_AT_LEAST(1,8,0)
+
+AP_DECLARE(apr_status_t) ap_thread_current_create(apr_thread_t **current,
+                                                  apr_threadattr_t *attr,
+                                                  apr_pool_t *pool)
+{
+#if AP_HAS_THREAD_LOCAL
+    apr_status_t rv;
+    apr_allocator_t *ta;
+    apr_abortfunc_t abort_fn;
+    apr_os_thread_t osthd;
+    apr_pool_t *p;
+
+    *current = ap_thread_current();
+    if (*current) {
+        return APR_EEXIST;
+    }
+
+    abort_fn = (pool) ? apr_pool_abort_get(pool) : NULL;
+    rv = apr_allocator_create(&ta);
+    if (rv != APR_SUCCESS) {
+        if (abort_fn)
+            abort_fn(rv);
+        return rv;
+    }
+    /* Don't let the thread's pool allocator with no limits */
+    apr_allocator_max_free_set(ta, ap_max_mem_free);
+    rv = apr_pool_create_unmanaged_ex(&p, abort_fn, ta);
+    if (rv != APR_SUCCESS) {
+        return rv;
+    }
+    apr_allocator_owner_set(ta, p);
+
+    osthd = apr_os_thread_current();
+    rv = apr_os_thread_put(current, &osthd, p);
+    if (rv != APR_SUCCESS) {
+        apr_pool_destroy(p);
+        return rv;
+    }
+
+    current_thread = *current;
+    return APR_SUCCESS;
+#else
+    return APR_ENOTIMPL;
+#endif
+}
+
+AP_DECLARE(void) ap_thread_current_after_fork(void)
+{
+#if AP_HAS_THREAD_LOCAL
+    current_thread = NULL;
+#endif
+}
+
+AP_DECLARE(apr_thread_t *) ap_thread_current(void)
+{
+#if AP_HAS_THREAD_LOCAL
+    return current_thread;
+#else
+    return NULL;
+#endif
+}
+
+#endif /* !APR_VERSION_AT_LEAST(1,8,0) */
 
 #endif /* APR_HAS_THREADS */
 

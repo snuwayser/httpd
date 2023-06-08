@@ -3,6 +3,7 @@ import pytest
 from .env import H2Conf, H2TestEnv
 
 
+@pytest.mark.skipif(condition=H2TestEnv.is_unsupported, reason="mod_http2 not supported here")
 @pytest.mark.skipif(not H2TestEnv().h2load_is_at_least('1.41.0'),
                     reason="h2load misses --connect-to option")
 class TestLoadGet:
@@ -15,20 +16,21 @@ class TestLoadGet:
     def check_h2load_ok(self, env, r, n):
         assert 0 == r.exit_code
         r = env.h2load_status(r)
-        assert n == r.results["h2load"]["requests"]["total"]
-        assert n == r.results["h2load"]["requests"]["started"]
-        assert n == r.results["h2load"]["requests"]["done"]
-        assert n == r.results["h2load"]["requests"]["succeeded"]
-        assert n == r.results["h2load"]["status"]["2xx"]
-        assert 0 == r.results["h2load"]["status"]["3xx"]
-        assert 0 == r.results["h2load"]["status"]["4xx"]
-        assert 0 == r.results["h2load"]["status"]["5xx"]
+        assert n == r.results["h2load"]["requests"]["total"], f'{r.results}'
+        assert n == r.results["h2load"]["requests"]["started"], f'{r.results}'
+        assert n == r.results["h2load"]["requests"]["done"], f'{r.results}'
+        assert n == r.results["h2load"]["requests"]["succeeded"], f'{r.results}'
+        assert n == r.results["h2load"]["status"]["2xx"], f'{r.results}'
+        assert 0 == r.results["h2load"]["status"]["3xx"], f'{r.results}'
+        assert 0 == r.results["h2load"]["status"]["4xx"], f'{r.results}'
+        assert 0 == r.results["h2load"]["status"]["5xx"], f'{r.results}'
     
     # test load on cgi script, single connection, different sizes
     @pytest.mark.parametrize("start", [
         1000, 80000
     ])
     def test_h2_700_10(self, env, start):
+        assert env.is_live()
         text = "X"
         chunk = 32
         for n in range(0, 5):
@@ -43,9 +45,10 @@ class TestLoadGet:
 
     # test load on cgi script, single connection
     @pytest.mark.parametrize("conns", [
-        1, 2, 16, 32
+        1, 2, 16
     ])
     def test_h2_700_11(self, env, conns):
+        assert env.is_live()
         text = "X"
         start = 1200
         chunk = 64

@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-/*                      _             _
+/*
  *  ap_expr_eval.c, based on ssl_expr_eval.c from mod_ssl
  */
 
@@ -124,7 +124,6 @@ static const char *ap_expr_list_pstrcat(apr_pool_t *p,
         for (i = 0; i < n; ++i) {
             val = APR_ARRAY_IDX(list, i, const char*);
             vlen = strlen(val);
-            ap_varbuf_grow(&vb, vlen + slen + 1);
             ap_varbuf_strmemcat(&vb, val, vlen);
             ap_varbuf_strmemcat(&vb, sep, slen);
         }
@@ -593,7 +592,10 @@ AP_DECLARE(const char *) ap_expr_parse(apr_pool_t *pool, apr_pool_t *ptemp,
     ctx.lookup_fn   = lookup_fn ? lookup_fn : ap_expr_lookup_default;
     ctx.at_start    = 1;
 
-    ap_expr_yylex_init(&ctx.scanner);
+    rc = ap_expr_yylex_init(&ctx.scanner);
+    if (rc)
+        return "ap_expr_yylex_init error";
+
     ap_expr_yyset_extra(&ctx, ctx.scanner);
     rc = ap_expr_yyparse(&ctx);
     ap_expr_yylex_destroy(ctx.scanner);
